@@ -23,9 +23,11 @@ CREATE TABLE IF NOT EXISTS gsffc.events (
   description TEXT,
   capacity    INTEGER NOT NULL DEFAULT 0,
   signups     TEXT NOT NULL DEFAULT '[]',
-  checkins    TEXT NOT NULL DEFAULT '[]'
+  checkins    TEXT NOT NULL DEFAULT '[]',
+  checkin_radius INTEGER NOT NULL DEFAULT 10
 );
 
+-- Upgrade path for databases
 -- Events with physical locations only (online events excluded for now).
 INSERT INTO gsffc.events (id, title, date, time, location, lat, lng, description, capacity, signups) VALUES
   ('6a2a24a22e8d92aecd66b520', '周六例行训练赛 11v11', '2026-06-13', '16:00 - 18:00',

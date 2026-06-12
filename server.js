@@ -1,7 +1,9 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const path = require('path');
 const express = require('express');
 const session = require('express-session');
+const PgSession = require('connect-pg-simple')(session);
 const db = require('./db');
 
 const app = express();
@@ -13,9 +15,16 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(session({
+  store: new PgSession({
+    pool: db.pool,
+    schemaName: 'gsffc',
+    createTableIfMissing: true
+  }),
   secret: process.env.SESSION_SECRET || 'gsf-test-secret',
   resave: false,
-  saveUninitialized: false
+  saveUninitialized: false,
+  rolling: true,
+  cookie: { maxAge: 30 * 24 * 60 * 60 * 1000 } // stay signed in for 30 days
 }));
 
 app.use((req, res, next) => {
@@ -42,7 +51,11 @@ function requireLoginApi(req, res, next) {
   next();
 }
 
-const CHECKIN_RADIUS_METERS = 10;
+// Same avatar scheme as the production app (hackathon-starter gravatar helper)
+function gravatar(email, size = 80) {
+  const hash = crypto.createHash('md5').update(email.trim().toLowerCase()).digest('hex');
+  return `https://www.gravatar.com/avatar/${hash}?s=${size}&d=retro`;
+}
 
 function distanceMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000;
@@ -94,7 +107,12 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
   const checkins = event.checkins;
   const participants = event.signups.map(email => {
     const u = users.find(x => x.email === email);
-    return { name: u ? u.name : email, checkedIn: checkins.includes(email) };
+    return {
+      name: u ? u.name : email,
+      position: u && u.position ? u.position : '',
+      avatar: gravatar(email),
+      checkedIn: checkins.includes(email)
+    };
   });
   res.render('event', {
     title: event.title,
@@ -102,8 +120,7 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     participants,
     signedUp: event.signups.includes(req.session.user.email),
     checkedIn: checkins.includes(req.session.user.email),
-    isPast: event.date < new Date().toISOString().slice(0, 10),
-    checkinRadius: CHECKIN_RADIUS_METERS
+    isPast: event.date < new Date().toISOString().slice(0, 10)
   });
 }));
 
@@ -151,16 +168,35 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
     return res.status(400).json({ ok: false, message: '未获取到有效位置' });
   }
   const distance = Math.round(distanceMeters(lat, lng, event.coords.lat, event.coords.lng));
-  if (distance > CHECKIN_RADIUS_METERS) {
+  if (distance > event.checkinRadius) {
     return res.status(403).json({
       ok: false,
       distance,
-      message: `签到失败：你距离球场约 ${distance} 米，需在 ${CHECKIN_RADIUS_METERS} 米范围内`
+      message: `签到失败：你距离球场约 ${distance} 米，需在 ${event.checkinRadius} 米范围内`
     });
   }
   event.checkins.push(email);
   await db.updateEvent(event);
   res.json({ ok: true, distance, message: `签到成功！(距球场约 ${distance} 米)` });
+}));
+
+// POC only: let any member move the event location / resize the check-in
+// radius from the event page, so GPS check-in can be tested from anywhere.
+app.post('/event/:id/settings', requireLogin, wrap(async (req, res) => {
+  const event = await db.getEvent(req.params.id);
+  if (!event) return res.status(404).render('404', { title: 'Not Found' });
+  const lat = Number(req.body.lat);
+  const lng = Number(req.body.lng);
+  const radius = Math.round(Number(req.body.radius));
+  if (Number.isFinite(lat) && Number.isFinite(lng)
+    && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+    event.coords = { lat, lng };
+  }
+  if (Number.isFinite(radius) && radius > 0) {
+    event.checkinRadius = radius;
+  }
+  await db.updateEvent(event);
+  res.redirect(`/event/${event.id}`);
 }));
 
 app.get('/member-list', requireLogin, wrap(async (req, res) => {
@@ -199,7 +235,7 @@ app.put('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
   const event = await db.getEvent(req.params.id);
   if (!event) return res.status(404).json({ ok: false, message: '活动不存在' });
 
-  const EDITABLE_FIELDS = ['title', 'date', 'time', 'location', 'coords', 'description', 'capacity'];
+  const EDITABLE_FIELDS = ['title', 'date', 'time', 'location', 'coords', 'description', 'capacity', 'checkinRadius'];
   for (const field of EDITABLE_FIELDS) {
     if (req.body[field] !== undefined) event[field] = req.body[field];
   }
@@ -215,6 +251,10 @@ app.put('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
     && (typeof event.coords !== 'object'
       || !Number.isFinite(event.coords.lat) || !Number.isFinite(event.coords.lng))) {
     return res.status(400).json({ ok: false, message: 'coords 必须为 null 或 {lat, lng}' });
+  }
+  event.checkinRadius = Number(event.checkinRadius);
+  if (!Number.isInteger(event.checkinRadius) || event.checkinRadius <= 0) {
+    return res.status(400).json({ ok: false, message: 'checkinRadius 必须为正整数' });
   }
 
   await db.updateEvent(event);

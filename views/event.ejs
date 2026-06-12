@@ -27,7 +27,7 @@
               <div id="field-map" class="rounded border mb-2" style="height: 260px;"></div>
               <div id="position-status" class="mb-2 text-muted">正在获取你的位置…</div>
               <button class="btn btn-success" id="checkin-btn" type="button" disabled>📍 到场签到</button>
-              <small class="text-muted ml-2">进入绿圈（球场 <%= checkinRadius %> 米范围）后即可签到</small>
+              <small class="text-muted ml-2">进入绿圈（球场 <%= event.checkinRadius %> 米范围）后即可签到</small>
               <div id="checkin-msg" class="mt-2"></div>
             <% } %>
           </div>
@@ -43,7 +43,7 @@
   </div>
 
   <div class="col-md-4">
-    <div class="card">
+    <div class="card mb-4">
       <div class="card-header">报名名单 (<%= participants.length %> / <%= event.capacity %>)</div>
       <ul class="list-group list-group-flush">
         <% if (participants.length === 0) { %>
@@ -57,8 +57,61 @@
         <% }) %>
       </ul>
     </div>
+
+    <div class="card border-warning">
+      <div class="card-header bg-warning">🧪 测试设置（仅POC）</div>
+      <div class="card-body">
+        <p class="small text-muted mb-2">修改本活动的签到点坐标和签到半径，方便在任意位置测试GPS签到。</p>
+        <form method="POST" action="/event/<%= event.id %>/settings">
+          <div class="form-group mb-2">
+            <label class="small mb-0" for="set-lat">纬度 Latitude</label>
+            <input class="form-control form-control-sm" id="set-lat" name="lat" type="number" step="any" required
+                   value="<%= event.coords ? event.coords.lat : '' %>">
+          </div>
+          <div class="form-group mb-2">
+            <label class="small mb-0" for="set-lng">经度 Longitude</label>
+            <input class="form-control form-control-sm" id="set-lng" name="lng" type="number" step="any" required
+                   value="<%= event.coords ? event.coords.lng : '' %>">
+          </div>
+          <div class="form-group mb-2">
+            <label class="small mb-0" for="set-radius">签到半径（米）</label>
+            <input class="form-control form-control-sm" id="set-radius" name="radius" type="number" min="1" step="1" required
+                   value="<%= event.checkinRadius %>">
+          </div>
+          <button class="btn btn-sm btn-outline-secondary" id="use-my-location" type="button">📍 填入我的当前位置</button>
+          <button class="btn btn-sm btn-warning" type="submit">保存</button>
+          <% if (signedUp && !checkedIn && !isPast && event.coords) { %>
+            <div class="small text-muted mt-2">提示：也可以直接点击左侧地图选择新签到点。</div>
+          <% } %>
+        </form>
+      </div>
+    </div>
   </div>
 </div>
+
+<script>
+  (function () {
+    var btn = document.getElementById('use-my-location');
+    btn.addEventListener('click', function () {
+      if (!navigator.geolocation) {
+        alert('当前浏览器不支持定位');
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = '定位中…';
+      navigator.geolocation.getCurrentPosition(function (pos) {
+        document.getElementById('set-lat').value = pos.coords.latitude.toFixed(7);
+        document.getElementById('set-lng').value = pos.coords.longitude.toFixed(7);
+        btn.disabled = false;
+        btn.textContent = '📍 填入我的当前位置';
+      }, function (err) {
+        alert('无法获取位置：' + err.message);
+        btn.disabled = false;
+        btn.textContent = '📍 填入我的当前位置';
+      }, { enableHighAccuracy: true, timeout: 15000 });
+    });
+  })();
+</script>
 
 <% if (signedUp && !checkedIn && !isPast && event.coords) { %>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
@@ -66,7 +119,7 @@
 <script>
   (function () {
     var FIELD = { lat: <%= event.coords.lat %>, lng: <%= event.coords.lng %> };
-    var RADIUS = <%= checkinRadius %>;
+    var RADIUS = <%= event.checkinRadius %>;
     var btn = document.getElementById('checkin-btn');
     var msg = document.getElementById('checkin-msg');
     var status = document.getElementById('position-status');
@@ -84,6 +137,37 @@
       radius: RADIUS, color: '#28a745', fillColor: '#28a745', fillOpacity: 0.15
     }).addTo(map);
     map.fitBounds(boundary.getBounds(), { maxZoom: 19, padding: [20, 20] });
+
+    // POC: click the map to pick a new check-in point; shown as a dashed
+    // orange circle until saved via the test-settings form.
+    var setLat = document.getElementById('set-lat');
+    var setLng = document.getElementById('set-lng');
+    var setRadius = document.getElementById('set-radius');
+    var preview = null;
+
+    function updatePreview() {
+      var lat = parseFloat(setLat.value), lng = parseFloat(setLng.value);
+      var r = parseFloat(setRadius.value);
+      if (!isFinite(lat) || !isFinite(lng)) return;
+      if (!isFinite(r) || r <= 0) r = RADIUS;
+      if (lat === FIELD.lat && lng === FIELD.lng && r === RADIUS) return;
+      if (!preview) {
+        preview = L.circle([lat, lng], {
+          radius: r, color: '#fd7e14', dashArray: '6 6', fillColor: '#fd7e14', fillOpacity: 0.08
+        }).addTo(map).bindPopup('新签到点（未保存，点“保存”生效）');
+      } else {
+        preview.setLatLng([lat, lng]).setRadius(r);
+      }
+    }
+
+    map.on('click', function (e) {
+      setLat.value = e.latlng.lat.toFixed(7);
+      setLng.value = e.latlng.lng.toFixed(7);
+      updatePreview();
+    });
+    setLat.addEventListener('input', updatePreview);
+    setLng.addEventListener('input', updatePreview);
+    setRadius.addEventListener('input', updatePreview);
 
     function distanceMeters(lat1, lng1, lat2, lng2) {
       var R = 6371000, toRad = function (d) { return d * Math.PI / 180; };

@@ -26,6 +26,7 @@ function rowToEvent(row) {
     coords: row.lat != null && row.lng != null ? { lat: row.lat, lng: row.lng } : null,
     description: row.description,
     capacity: row.capacity,
+    checkinRadius: row.checkin_radius != null ? row.checkin_radius : 10,
     signups: JSON.parse(row.signups),
     checkins: JSON.parse(row.checkins)
   };
@@ -78,7 +79,7 @@ async function updateEvent(event) {
     `UPDATE ${SCHEMA}.events SET
        title = $2, date = $3, time = $4, location = $5,
        lat = $6, lng = $7, description = $8, capacity = $9,
-       signups = $10, checkins = $11
+       signups = $10, checkins = $11, checkin_radius = $12
      WHERE id = $1`,
     [
       event.id,
@@ -91,9 +92,10 @@ async function updateEvent(event) {
       event.description,
       event.capacity,
       JSON.stringify(event.signups || []),
-      JSON.stringify(event.checkins || [])
+      JSON.stringify(event.checkins || []),
+      event.checkinRadius || 10
     ]
   );
 }
 
-module.exports = { init, getUsers, getUserByEmail, verifyPassword, createUser, getEvents, getEvent, updateEvent };
+module.exports = { init, pool, getUsers, getUserByEmail, verifyPassword, createUser, getEvents, getEvent, updateEvent };
