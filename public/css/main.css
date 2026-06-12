@@ -1,0 +1,21 @@
+body {
+  padding-top: 70px;
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+}
+
+.main-content {
+  flex: 1;
+}
+
+footer {
+  margin-top: 2rem;
+  padding: 1rem 0;
+  border-top: 1px solid #e7e7e7;
+  color: #777;
+}
+
+footer a {
+  color: #777;
+}

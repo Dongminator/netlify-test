@@ -1,0 +1,35 @@
+<%- include('partials/header') %>
+<div class="pb-2 mt-2 mb-4 border-bottom"><h3>活动日历</h3></div>
+
+<h5 class="text-primary">即将开始</h5>
+<% if (upcoming.length === 0) { %>
+  <p class="text-muted">暂无活动</p>
+<% } %>
+<div class="list-group mb-4">
+  <% upcoming.forEach(e => { %>
+    <a class="list-group-item list-group-item-action" href="/event/<%= e.id %>">
+      <div class="d-flex w-100 justify-content-between">
+        <h5 class="mb-1"><%= e.title %></h5>
+        <span class="badge badge-primary badge-pill align-self-center"><%= e.signups.length %> / <%= e.capacity %> 已报名</span>
+      </div>
+      <p class="mb-1 text-muted">📅 <%= e.date %> <%= e.time %> &nbsp; 📍 <%= e.location %></p>
+    </a>
+  <% }) %>
+</div>
+
+<h5 class="text-secondary">已结束</h5>
+<% if (past.length === 0) { %>
+  <p class="text-muted">暂无</p>
+<% } %>
+<div class="list-group mb-4">
+  <% past.forEach(e => { %>
+    <a class="list-group-item list-group-item-action text-muted" href="/event/<%= e.id %>">
+      <div class="d-flex w-100 justify-content-between">
+        <h5 class="mb-1"><%= e.title %></h5>
+        <span class="badge badge-secondary badge-pill align-self-center"><%= e.signups.length %> 人参加</span>
+      </div>
+      <p class="mb-1">📅 <%= e.date %> <%= e.time %> &nbsp; 📍 <%= e.location %></p>
+    </a>
+  <% }) %>
+</div>
+<%- include('partials/footer') %>
