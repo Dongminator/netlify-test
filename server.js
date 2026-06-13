@@ -1,5 +1,6 @@
 require('dotenv').config();
 const crypto = require('crypto');
+const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const session = require('express-session');
@@ -9,8 +10,13 @@ const db = require('./db');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Resolve the views dir for both local runs (__dirname) and bundled serverless
+// functions, where included files land relative to the working directory.
+const viewsDir = [path.join(__dirname, 'views'), path.join(process.cwd(), 'views')]
+  .find(p => fs.existsSync(p)) || path.join(__dirname, 'views');
+
 app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
+app.set('views', viewsDir);
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -268,11 +274,13 @@ app.use((err, req, res, next) => {
   res.status(500).render('404', { title: 'Server Error' });
 });
 
-db.init().then(() => {
+// Only start a long-running server when executed directly (local dev / a
+// container host). On Netlify the app is driven by netlify/functions/server.js.
+// The database schema is provisioned separately from db/schema.sql.
+if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`GSF test app running at http://localhost:${PORT}`);
   });
-}).catch(err => {
-  console.error('DB init failed:', err);
-  process.exit(1);
-});
+}
+
+module.exports = app;

@@ -1,0 +1,20 @@
+# Netlify deployment config for the GSF test app.
+# The Express app runs as a single serverless function; static assets in
+# public/ are served directly from the CDN.
+
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+  # EJS templates are read from disk at runtime, so esbuild can't trace them
+  # automatically — ship them alongside the function.
+  included_files = ["views/**"]
+
+# Serve everything that isn't a static file through the Express app.
+# force = false (default) lets real files in public/ win first.
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/server"
+  status = 200

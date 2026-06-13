@@ -1,19 +1,13 @@
-const fs = require('fs');
-const path = require('path');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 
-const SCHEMA_FILE = path.join(__dirname, 'db', 'schema.sql');
 // All tables live in this hardcoded schema; every query below is prefixed with it.
+// The schema itself is provisioned manually from db/schema.sql — not by this code.
 const SCHEMA = 'gsffc';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || undefined
 });
-
-async function init() {
-  await pool.query(fs.readFileSync(SCHEMA_FILE, 'utf8'));
-}
 
 function rowToEvent(row) {
   if (!row) return null;
@@ -98,4 +92,4 @@ async function updateEvent(event) {
   );
 }
 
-module.exports = { init, pool, getUsers, getUserByEmail, verifyPassword, createUser, getEvents, getEvent, updateEvent };
+module.exports = { pool, getUsers, getUserByEmail, verifyPassword, createUser, getEvents, getEvent, updateEvent };

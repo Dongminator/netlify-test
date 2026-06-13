@@ -11,6 +11,20 @@ npm start
 
 打开 http://localhost:3000 （默认跳转到活动日历，未登录会先跳到登录页）。
 
+需要一个 PostgreSQL 数据库（如 Supabase），在 `.env` 中配置 `DATABASE_URL` 和 `SESSION_SECRET`（见 `.env.example`）。表结构和种子数据在 `db/schema.sql`，**首次部署前手动在数据库执行一次**（应用代码不会自动建表）。
+
+## 部署到 Netlify
+
+整个 Express 应用通过 [`serverless-http`](https://github.com/dougmoscrop/serverless-http) 打包成单个 Netlify Function 运行，`public/` 下的静态资源由 CDN 直接提供。
+
+1. 把仓库连接到 Netlify（或用 `netlify deploy`）。构建配置已在 `netlify.toml` 中：发布目录 `public/`，函数目录 `netlify/functions/`，并通过重定向把所有非静态请求转发给 `server` 函数。
+2. 在 Netlify 站点的 **Site settings → Environment variables** 中设置：
+   - `DATABASE_URL` —— PostgreSQL 连接串（Netlify Functions 是无状态的，需要一个外部数据库；session 也存在该库里）
+   - `SESSION_SECRET` —— 任意随机字符串
+3. Node 版本固定为 22（`package.json` 的 `engines` + 函数运行时）。
+
+本地用 `netlify dev` 可模拟该环境（需要 `npm i -g netlify-cli`）。
+
 ## 测试账号
 
 所有种子账号密码均为 `gsf2026`：
