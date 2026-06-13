@@ -1,121 +1,184 @@
 <%- include('partials/header') %>
+<% const isAdmin = user && user.role === 'ADMIN'; %>
+<%# Start and end are stored as 'YYYY-MM-DDTHH:MM', so the clock half is a slice.
+    The end repeats its date only when the event runs past midnight — otherwise
+    "2026-06-13 16:00 - 18:00" says it. %>
+<% const clock = at => at.slice(11, 16); %>
+<% const whenLabel = event.date + ' ' + clock(event.startAt) + ' - '
+     + (event.endDate === event.date ? '' : event.endDate + ' ') + clock(event.endAt); %>
 <div class="pb-2 mt-2 mb-4 border-bottom">
-  <h3><%= event.title %>
+  <h3 class="mb-0"><%= event.title %>
     <% if (isPast) { %><span class="badge badge-secondary">已结束</span><% } %>
   </h3>
 </div>
 
+<% if (joinedWaitlist) { %>
+  <%# Raised by the ?joined=waitlist redirect from POST /event/:id/signup — the
+      event was full, so the signup was recorded as a waitlist one instead. %>
+  <div class="alert alert-warning" role="alert">
+    活动名额已满，你已加入<strong>候补名单</strong><% if (myPlace) { %>（第 <%= myPlace %> 位）<% } %>。
+    有人取消报名时会按报名先后自动补位。
+  </div>
+<% } %>
+
 <div class="row">
   <div class="col-md-8">
     <table class="table table-sm table-borderless">
-      <tr><th class="text-nowrap" style="width:6rem">时间</th><td><%= event.date %> <%= event.time %></td></tr>
+      <tr><th class="text-nowrap" style="width:6rem">时间</th><td><%= whenLabel %></td></tr>
       <tr><th>地点</th><td><%= event.location %></td></tr>
       <tr><th>说明</th><td><%= event.description %></td></tr>
     </table>
 
-    <% if (!isPast) { %>
-      <% if (signedUp) { %>
-        <form method="POST" action="/event/<%= event.id %>/withdraw" class="mb-3">
-          <button class="btn btn-outline-danger" type="submit">取消报名</button>
-          <span class="text-success ml-2">✓ 你已报名</span>
-        </form>
-        <% if (event.coords) { %>
-          <div class="mb-4">
-            <% if (checkedIn) { %>
-              <span class="badge badge-success p-2">✓ 已到场签到</span>
-            <% } else { %>
-              <div id="field-map" class="rounded border mb-2" style="height: 260px;"></div>
-              <div id="position-status" class="mb-2 text-muted">正在获取你的位置…</div>
-              <button class="btn btn-success" id="checkin-btn" type="button" disabled>📍 到场签到</button>
-              <small class="text-muted ml-2">进入绿圈（球场 <%= event.checkinRadius %> 米范围）后即可签到</small>
-              <div id="checkin-msg" class="mt-2"></div>
-            <% } %>
-          </div>
+    <% if (!isPast && signedUp && event.coords) { %>
+      <div class="mb-4">
+        <% if (checkedIn) { %>
+          <span class="badge badge-success p-2">✓ 已到场签到<% if (myCheckinAt) { %> · <%= myCheckinAt %><% } %></span>
+        <% } else { %>
+          <div id="field-map" class="rounded border mb-2" style="height: 260px;"></div>
+          <div id="position-status" class="mb-2 text-muted">正在获取你的位置…</div>
+          <button class="btn btn-success" id="checkin-btn" type="button" disabled>📍 到场签到</button>
+          <small class="text-muted ml-2">进入绿圈（球场 <%= event.checkinRadius %> 米范围）后即可签到</small>
+          <div id="checkin-msg" class="mt-2"></div>
         <% } %>
-      <% } else if (event.signups.length >= event.capacity) { %>
-        <p class="text-danger mb-4">报名人数已满</p>
-      <% } else { %>
-        <form method="POST" action="/event/<%= event.id %>/signup" class="mb-4">
-          <button class="btn btn-primary" type="submit">报名</button>
-        </form>
-      <% } %>
+      </div>
     <% } %>
   </div>
 
   <div class="col-md-4">
-    <div class="card mb-4">
-      <div class="card-header">报名名单 (<%= participants.length %> / <%= event.capacity %>)</div>
-      <ul class="list-group list-group-flush">
-        <% if (participants.length === 0) { %>
-          <li class="list-group-item text-muted">还没有人报名</li>
+    <%# The roster is an avatar grid, like the production app: gravatar over the
+        member's name, wrapping to as many rows as it takes. A check-in shows as a
+        green ring plus a tick badge rather than its own row-level label. It sits
+        in the open, with no card around it — the border and its padding cost a
+        column of avatars in this narrow sidebar. %>
+    <%# The tooltip is where the timestamps live: the grid has room for a name and
+        nothing else, but every signup and check-in now carries its own time. %>
+    <% const rosterTitle = p => p.name
+         + (p.position ? ' · ' + p.position : '')
+         + (p.signedUpAt ? '\n报名：' + p.signedUpAt : '')
+         + (p.checkedInAt ? '\n签到：' + p.checkedInAt : ''); %>
+    <div class="roster-block mb-4">
+      <div class="roster-head">已报名人数：<%= participants.length %> / <%= event.capacity %></div>
+      <% if (participants.length === 0) { %>
+        <p class="text-muted mb-0">还没有人报名</p>
+      <% } else { %>
+        <ul class="roster">
+          <% participants.forEach(p => { %>
+            <li class="roster-item" title="<%= rosterTitle(p) %>">
+              <span class="roster-avatar<%= p.checkedIn ? ' is-checked-in' : '' %>">
+                <img src="<%= p.avatar %>" alt="" width="48" height="48" loading="lazy">
+                <% if (p.checkedIn) { %>
+                  <i class="fas fa-check roster-tick" aria-hidden="true"></i>
+                  <span class="sr-only">已签到</span>
+                <% } %>
+              </span>
+              <span class="roster-name"><%= p.name %></span>
+            </li>
+          <% }) %>
+        </ul>
+        <% if (participants.some(p => p.checkedIn)) { %>
+          <p class="roster-legend mb-0">
+            <i class="fas fa-check" aria-hidden="true"></i> 已到场签到
+          </p>
         <% } %>
-        <% participants.forEach((p, i) => { %>
-          <li class="list-group-item d-flex justify-content-between align-items-center">
-            <span><%= i + 1 %>. <%= p.name %></span>
-            <% if (p.checkedIn) { %><span class="badge badge-success">已签到</span><% } %>
-          </li>
-        <% }) %>
-      </ul>
+      <% } %>
     </div>
 
-    <div class="card border-warning">
-      <div class="card-header bg-warning">🧪 测试设置（仅POC）</div>
-      <div class="card-body">
-        <p class="small text-muted mb-2">修改本活动的签到点坐标和签到半径，方便在任意位置测试GPS签到。</p>
-        <form method="POST" action="/event/<%= event.id %>/settings">
-          <div class="form-group mb-2">
-            <label class="small mb-0" for="set-lat">纬度 Latitude</label>
-            <input class="form-control form-control-sm" id="set-lat" name="lat" type="number" step="any" required
-                   value="<%= event.coords ? event.coords.lat : '' %>">
-          </div>
-          <div class="form-group mb-2">
-            <label class="small mb-0" for="set-lng">经度 Longitude</label>
-            <input class="form-control form-control-sm" id="set-lng" name="lng" type="number" step="any" required
-                   value="<%= event.coords ? event.coords.lng : '' %>">
-          </div>
-          <div class="form-group mb-2">
-            <label class="small mb-0" for="set-radius">签到半径（米）</label>
-            <input class="form-control form-control-sm" id="set-radius" name="radius" type="number" min="1" step="1" required
-                   value="<%= event.checkinRadius %>">
-          </div>
-          <button class="btn btn-sm btn-outline-secondary" id="use-my-location" type="button">📍 填入我的当前位置</button>
-          <button class="btn btn-sm btn-warning" type="submit">保存</button>
-          <% if (signedUp && !checkedIn && !isPast && event.coords) { %>
-            <div class="small text-muted mt-2">提示：也可以直接点击左侧地图选择新签到点。</div>
-          <% } %>
-        </form>
+    <%# The waitlist, in the order it will be served. Same grid as the roster
+        above so the two read as one list, but the avatars are dimmed and the
+        tick badge is replaced by the member's place in the queue. Rendered only
+        when somebody is actually waiting. %>
+    <% if (waitlist.length) { %>
+      <div class="roster-block roster-block-waitlist mb-4">
+        <div class="roster-head">候补名单：<%= waitlist.length %> 人</div>
+        <ul class="roster">
+          <% waitlist.forEach(p => { %>
+            <li class="roster-item" title="<%= rosterTitle(p) %>">
+              <span class="roster-avatar is-waitlisted">
+                <img src="<%= p.avatar %>" alt="" width="48" height="48" loading="lazy">
+                <span class="roster-queue"><%= p.place %></span>
+                <span class="sr-only">候补第 <%= p.place %> 位</span>
+              </span>
+              <span class="roster-name"><%= p.name %></span>
+            </li>
+          <% }) %>
+        </ul>
+        <p class="roster-legend mb-0">数字为候补顺序，有人取消报名时按此顺序自动补位。</p>
       </div>
-    </div>
+    <% } %>
   </div>
 </div>
 
-<script>
-  (function () {
-    var btn = document.getElementById('use-my-location');
-    btn.addEventListener('click', function () {
-      if (!navigator.geolocation) {
-        alert('当前浏览器不支持定位');
-        return;
-      }
-      btn.disabled = true;
-      btn.textContent = '定位中…';
-      navigator.geolocation.getCurrentPosition(function (pos) {
-        document.getElementById('set-lat').value = pos.coords.latitude.toFixed(7);
-        document.getElementById('set-lng').value = pos.coords.longitude.toFixed(7);
-        btn.disabled = false;
-        btn.textContent = '📍 填入我的当前位置';
-      }, function (err) {
-        alert('无法获取位置：' + err.message);
-        btn.disabled = false;
-        btn.textContent = '📍 填入我的当前位置';
-      }, { enableHighAccuracy: true, timeout: 15000 });
-    });
-  })();
-</script>
+<%# One stacked list of actions, divider-separated: the member's own signup
+    button first, then the admin-only ones. It lives under the whole row, below
+    the roster, so the buttons are the last thing on the page in either layout.
+    Buttons go full-width on a phone. %>
+<div class="event-actions">
+  <% if (!isPast) { %>
+    <% if (signedUp) { %>
+      <div class="event-action">
+        <form method="POST" action="/event/<%= event.id %>/withdraw">
+          <button class="btn btn-outline-danger btn-action" type="submit">取消报名</button>
+        </form>
+        <span class="text-success event-action-note">
+          ✓ 你已报名<% if (checkedIn && myCheckinAt) { %>，<%= myCheckinAt %> 已签到<% } %>
+        </span>
+      </div>
+    <% } else if (waitlisted) { %>
+      <%# Leaving the waitlist is the same POST as leaving the roster — the route
+          deletes whichever kind of signup you hold. %>
+      <div class="event-action">
+        <form method="POST" action="/event/<%= event.id %>/withdraw">
+          <button class="btn btn-outline-danger btn-action" type="submit">退出候补</button>
+        </form>
+        <span class="text-warning event-action-note">⏳ 你在候补名单第 <%= myPlace %> 位</span>
+      </div>
+    <% } else if (participants.length >= event.capacity) { %>
+      <div class="event-action">
+        <form method="POST" action="/event/<%= event.id %>/signup">
+          <button class="btn btn-warning btn-action" type="submit">加入候补名单</button>
+        </form>
+        <span class="event-action-note text-muted">名额已满，有人取消时自动补位</span>
+      </div>
+    <% } else { %>
+      <div class="event-action">
+        <form method="POST" action="/event/<%= event.id %>/signup">
+          <button class="btn btn-success btn-action" type="submit">报名</button>
+        </form>
+      </div>
+    <% } %>
+  <% } %>
+
+  <% if (isAdmin) { %>
+    <%# Both open the one event modal; `data-event-modal` tells it whether to PUT
+        this event or POST a copy of it (prefilled, dated a week on). %>
+    <div class="event-action">
+      <button class="btn btn-brand btn-action" type="button"
+              data-event-modal="edit" data-toggle="modal" data-target="#event-modal">
+        <i class="fas fa-pen mr-1" aria-hidden="true"></i>编辑活动
+      </button>
+    </div>
+    <div class="event-action">
+      <form method="POST" action="/event/<%= event.id %>/clear-signups"
+            onsubmit="return confirm('确定清空本次活动的全部报名和签到吗？此操作无法撤销。');">
+        <button class="btn btn-danger btn-action" type="submit">
+          <i class="fas fa-trash mr-1" aria-hidden="true"></i>清空报名
+        </button>
+      </form>
+    </div>
+    <div class="event-action">
+      <button class="btn btn-brand btn-action" type="button"
+              data-event-modal="copy" data-toggle="modal" data-target="#event-modal">
+        <i class="fas fa-plus mr-1" aria-hidden="true"></i>复制
+      </button>
+    </div>
+  <% } %>
+</div>
+
+<% if (isAdmin) { %>
+  <%- include('partials/event-modal', { formEvent: event, defaultDate: event.date }) %>
+<% } %>
 
 <% if (signedUp && !checkedIn && !isPast && event.coords) { %>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
   (function () {
     var FIELD = { lat: <%= event.coords.lat %>, lng: <%= event.coords.lng %> };
@@ -137,37 +200,6 @@
       radius: RADIUS, color: '#28a745', fillColor: '#28a745', fillOpacity: 0.15
     }).addTo(map);
     map.fitBounds(boundary.getBounds(), { maxZoom: 19, padding: [20, 20] });
-
-    // POC: click the map to pick a new check-in point; shown as a dashed
-    // orange circle until saved via the test-settings form.
-    var setLat = document.getElementById('set-lat');
-    var setLng = document.getElementById('set-lng');
-    var setRadius = document.getElementById('set-radius');
-    var preview = null;
-
-    function updatePreview() {
-      var lat = parseFloat(setLat.value), lng = parseFloat(setLng.value);
-      var r = parseFloat(setRadius.value);
-      if (!isFinite(lat) || !isFinite(lng)) return;
-      if (!isFinite(r) || r <= 0) r = RADIUS;
-      if (lat === FIELD.lat && lng === FIELD.lng && r === RADIUS) return;
-      if (!preview) {
-        preview = L.circle([lat, lng], {
-          radius: r, color: '#fd7e14', dashArray: '6 6', fillColor: '#fd7e14', fillOpacity: 0.08
-        }).addTo(map).bindPopup('新签到点（未保存，点“保存”生效）');
-      } else {
-        preview.setLatLng([lat, lng]).setRadius(r);
-      }
-    }
-
-    map.on('click', function (e) {
-      setLat.value = e.latlng.lat.toFixed(7);
-      setLng.value = e.latlng.lng.toFixed(7);
-      updatePreview();
-    });
-    setLat.addEventListener('input', updatePreview);
-    setLng.addEventListener('input', updatePreview);
-    setRadius.addEventListener('input', updatePreview);
 
     function distanceMeters(lat1, lng1, lat2, lng2) {
       var R = 6371000, toRad = function (d) { return d * Math.PI / 180; };

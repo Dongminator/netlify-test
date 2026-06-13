@@ -1,35 +1,79 @@
 <%- include('partials/header') %>
-<div class="pb-2 mt-2 mb-4 border-bottom"><h3>活动日历</h3></div>
-
-<h5 class="text-primary">即将开始</h5>
-<% if (upcoming.length === 0) { %>
-  <p class="text-muted">暂无活动</p>
-<% } %>
-<div class="list-group mb-4">
-  <% upcoming.forEach(e => { %>
-    <a class="list-group-item list-group-item-action" href="/event/<%= e.id %>">
-      <div class="d-flex w-100 justify-content-between">
-        <h5 class="mb-1"><%= e.title %></h5>
-        <span class="badge badge-primary badge-pill align-self-center"><%= e.signups.length %> / <%= e.capacity %> 已报名</span>
-      </div>
-      <p class="mb-1 text-muted">📅 <%= e.date %> <%= e.time %> &nbsp; 📍 <%= e.location %></p>
-    </a>
-  <% }) %>
+<% // Weekday labels, Sunday first — Sunday is the grid's leftmost column. %>
+<% const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']; %>
+<% const isAdmin = user && user.role === 'ADMIN'; %>
+<div class="page-head">
+  <h3>活动日历</h3>
+  <% if (isAdmin) { %>
+    <button class="btn btn-brand ml-auto" type="button" data-toggle="modal" data-target="#event-modal">
+      <i class="fas fa-plus mr-1" aria-hidden="true"></i>添加活动
+    </button>
+  <% } %>
 </div>
 
-<h5 class="text-secondary">已结束</h5>
-<% if (past.length === 0) { %>
-  <p class="text-muted">暂无</p>
+<% if (created) { %>
+  <div class="flash-banner" id="created-banner" role="status">
+    <i class="fas fa-check-circle" aria-hidden="true"></i>
+    <span>活动已创建，已显示在下面的日历上。</span>
+  </div>
 <% } %>
-<div class="list-group mb-4">
-  <% past.forEach(e => { %>
-    <a class="list-group-item list-group-item-action text-muted" href="/event/<%= e.id %>">
-      <div class="d-flex w-100 justify-content-between">
-        <h5 class="mb-1"><%= e.title %></h5>
-        <span class="badge badge-secondary badge-pill align-self-center"><%= e.signups.length %> 人参加</span>
+
+<section class="cal card-surface" aria-label="活动日历">
+  <header class="cal-bar">
+    <div class="cal-title"><%= monthLabel %></div>
+    <nav class="cal-nav" aria-label="切换月份">
+      <a class="cal-btn" href="/calendar?month=<%= prevMonth %>" aria-label="上个月" rel="nofollow">
+        <i class="fas fa-chevron-left" aria-hidden="true"></i>
+      </a>
+      <a class="cal-btn cal-btn-today<%= isCurrentMonth ? ' is-disabled' : '' %>" href="/calendar">今天</a>
+      <a class="cal-btn" href="/calendar?month=<%= nextMonth %>" aria-label="下个月" rel="nofollow">
+        <i class="fas fa-chevron-right" aria-hidden="true"></i>
+      </a>
+    </nav>
+  </header>
+
+  <div class="cal-grid" role="grid">
+    <div class="cal-weekdays" role="row">
+      <% weekdays.forEach((label, i) => { %>
+        <div class="cal-weekday<%= (i === 0 || i === 6) ? ' is-weekend' : '' %>" role="columnheader">
+          <span class="d-none d-sm-inline"><%= label %></span>
+          <span class="d-sm-none"><%= label.slice(-1) %></span>
+        </div>
+      <% }) %>
+    </div>
+
+    <% weeks.forEach(week => { %>
+      <div class="cal-week" role="row">
+        <% week.forEach(day => { %>
+          <div class="cal-day<%= day.inMonth ? '' : ' is-outside' %><%= day.isToday ? ' is-today' : '' %><%= (day.weekday === 0 || day.weekday === 6) ? ' is-weekend' : '' %>" role="gridcell" data-date="<%= day.date %>">
+            <div class="cal-date"><%= day.day %></div>
+            <% day.events.forEach(e => { %>
+              <a class="cal-event<%= day.isPast ? ' is-past' : '' %>" href="/event/<%= e.id %>"
+                 title="<%= e.title %> · <%= e.time %> · <%= e.location %>">
+                <span class="cal-event-time"><%= (e.time || '').split(' ')[0] %></span>
+                <span class="cal-event-title"><%= e.title %></span>
+              </a>
+            <% }) %>
+          </div>
+        <% }) %>
       </div>
-      <p class="mb-1">📅 <%= e.date %> <%= e.time %> &nbsp; 📍 <%= e.location %></p>
-    </a>
-  <% }) %>
-</div>
+    <% }) %>
+  </div>
+</section>
+
+<% if (isAdmin) { %>
+  <%- include('partials/event-modal', { formEvent: null }) %>
+<% } %>
+
+<script>
+  (function () {
+    // The success banner is raised by ?created=1 after the modal reloads the
+    // page onto the new event's month; it closes itself 5 seconds later.
+    var banner = document.getElementById('created-banner');
+    if (!banner) return;
+    setTimeout(function () { banner.classList.add('is-leaving'); }, 5000);
+    banner.addEventListener('transitionend', function () { banner.remove(); });
+  })();
+</script>
+
 <%- include('partials/footer') %>

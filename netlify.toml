@@ -8,6 +8,11 @@
 
 [functions]
   node_bundler = "esbuild"
+  # Express loads the template engine via a dynamic require('ejs') at render
+  # time, which esbuild can't trace — bundling drops it and the function throws
+  # "Cannot find module 'ejs'". Mark it external so Netlify ships the real
+  # package in the function's node_modules instead of inlining it.
+  external_node_modules = ["ejs"]
   # EJS templates are read from disk at runtime, so esbuild can't trace them
   # automatically — ship them alongside the function.
   included_files = ["views/**"]

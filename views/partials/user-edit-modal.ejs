@@ -1,0 +1,210 @@
+<%# Edit-user form, shared by the admin's per-row pencil on /members and the
+    member's own "编辑" button on /profile. Any button with class `edit-user` and
+    data-email / data-name / data-position / data-role opens it; the PUT target is that email
+    and the route decides whether the caller may write it (self, or ADMIN).
+    On success the modal dispatches a `user-updated` event on `document` with
+    `detail.user`, and the including page updates whatever it renders. %>
+<%# data-self-email is on the modal, not on the 删除用户 button, because that
+    button only renders for admins and the password/name lock below needs the
+    viewer's own address on every page. %>
+<div class="modal fade" id="edit-user-modal" tabindex="-1" role="dialog"
+     aria-labelledby="edit-user-title" aria-hidden="true"
+     data-self-email="<%= user ? user.email : '' %>">
+  <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable" role="document">
+    <div class="modal-content">
+      <form id="edit-user-form">
+        <div class="modal-header">
+          <h5 class="modal-title" id="edit-user-title"><%= typeof editUserTitle === 'undefined' ? '编辑会员' : editUserTitle %></h5>
+          <button type="button" class="close" data-dismiss="modal" aria-label="关闭">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
+
+        <div class="modal-body">
+          <div id="edit-user-alert" class="alert d-none" role="alert"></div>
+          <%# Shown by the open handler when the row belongs to another admin:
+              those two fields are locked and the PUT refuses them anyway. %>
+          <div id="edit-user-locked-note" class="alert alert-info d-none" role="alert">
+            管理员的密码和姓名只能由本人修改，这里只能修改场上位置。
+          </div>
+
+          <div class="form-group field-inline-sm">
+            <label for="edit-user-email">账号</label>
+            <input class="form-control text-monospace" id="edit-user-email" type="text" readonly>
+          </div>
+          <div class="form-group field-inline-sm">
+            <label for="edit-user-password">密码</label>
+            <input class="form-control" id="edit-user-password" type="password"
+                   autocomplete="new-password" placeholder="留空表示不修改密码">
+            <small class="form-text text-muted">留空则保持原密码不变。</small>
+          </div>
+          <div class="form-group field-inline-sm">
+            <label for="edit-user-name">姓名</label>
+            <input class="form-control" id="edit-user-name" type="text" required>
+          </div>
+          <%# No 头像链接 field: the avatar URL is not editable from this form.
+              Omitting `profilePhoto` from the PUT body leaves the column as it
+              is — db.updateUser only writes keys that are present. %>
+          <div class="form-group field-inline-sm mb-0">
+            <label for="edit-user-position">场上位置</label>
+            <input class="form-control" id="edit-user-position" type="text"
+                   placeholder="如 前锋 / 中场 / 后卫 / 门将">
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <%# Rendering-only check, like every other admin control: DELETE
+              /api/users/:email re-reads the role from the database. Under sm the
+              footer is column-reverse, so this first child is the bottom button. %>
+          <% if (user && user.role === 'ADMIN') { %>
+            <button class="btn btn-outline-danger mr-auto" id="edit-user-delete"
+                    type="button">删除用户</button>
+          <% } %>
+          <button class="btn btn-secondary" type="button" data-dismiss="modal">取消</button>
+          <button class="btn btn-brand" id="edit-user-save" type="submit">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Deferred to DOMContentLoaded because jQuery and bootstrap's JS load from
+  // the footer partial, after this block is parsed.
+  document.addEventListener('DOMContentLoaded', function () {
+    var modal = document.getElementById('edit-user-modal');
+    var form = document.getElementById('edit-user-form');
+    var alertBox = document.getElementById('edit-user-alert');
+    var saveBtn = document.getElementById('edit-user-save');
+    var emailField = document.getElementById('edit-user-email');
+    var passwordField = document.getElementById('edit-user-password');
+    var nameField = document.getElementById('edit-user-name');
+    var positionField = document.getElementById('edit-user-position');
+    var deleteBtn = document.getElementById('edit-user-delete'); // admins only
+    var lockedNote = document.getElementById('edit-user-locked-note');
+    var selfEmail = modal.dataset.selfEmail || '';
+    var closeTimer = null;
+    // First click on 删除用户 arms it, the second one sends the request — a
+    // native confirm() would sit on top of the modal and reads badly on a phone.
+    var deleteArmed = false;
+
+    function resetDelete() {
+      if (!deleteBtn) return;
+      deleteArmed = false;
+      deleteBtn.disabled = false;
+      deleteBtn.textContent = '删除用户';
+      deleteBtn.classList.remove('btn-danger');
+      deleteBtn.classList.add('btn-outline-danger');
+    }
+
+    function showAlert(kind, message) {
+      alertBox.className = 'alert alert-' + kind;
+      alertBox.textContent = message;
+    }
+
+    function hideAlert() {
+      alertBox.className = 'alert d-none';
+      alertBox.textContent = '';
+    }
+
+    document.querySelectorAll('.edit-user').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        // A pending auto-close from the previous save must not fire on the
+        // row the admin just opened.
+        clearTimeout(closeTimer);
+        hideAlert();
+        saveBtn.disabled = false;
+        resetDelete();
+        emailField.value = btn.dataset.email;
+        passwordField.value = '';
+        nameField.value = btn.dataset.name;
+        positionField.value = btn.dataset.position;
+        var isSelf = btn.dataset.email === selfEmail;
+        var isAdminRow = (btn.dataset.role || '').toUpperCase() === 'ADMIN';
+        // Someone else's admin row: password and name are off limits, 场上位置
+        // is not. Rendering only — the PUT re-reads the role and refuses them.
+        var locked = isAdminRow && !isSelf;
+        passwordField.disabled = locked;
+        nameField.disabled = locked;
+        lockedNote.classList.toggle('d-none', !locked);
+        if (deleteBtn) {
+          // Deleting your own account would kill the session doing it, and no
+          // admin may be deleted at all — the route rejects both anyway, so this
+          // only keeps a button that can't work off the screen.
+          deleteBtn.classList.toggle('d-none', isSelf || isAdminRow);
+        }
+        $(modal).modal('show');
+      });
+    });
+
+    $(modal).on('hidden.bs.modal', function () {
+      clearTimeout(closeTimer);
+      passwordField.value = '';
+      resetDelete();
+    });
+
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      var email = emailField.value;
+      hideAlert();
+      saveBtn.disabled = true;
+      // The locked fields are left out of the body entirely rather than sent
+      // unchanged: db.updateUser only writes the keys it is given.
+      var payload = { position: positionField.value };
+      if (!passwordField.disabled) payload.password = passwordField.value;
+      if (!nameField.disabled) payload.name = nameField.value;
+      fetch('/api/users/' + encodeURIComponent(email), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).then(function (res) {
+        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+      }).then(function (r) {
+        if (!r.ok) throw new Error(r.body.message || '保存失败');
+        passwordField.value = '';
+        // The page that included this partial owns whatever it rendered from
+        // the user row, so hand it the saved values instead of reaching into
+        // markup this partial can't see.
+        document.dispatchEvent(new CustomEvent('user-updated', { detail: { user: r.body.user } }));
+        showAlert('success', 'Saved successfully');
+        closeTimer = setTimeout(function () { $(modal).modal('hide'); }, 5000);
+      }).catch(function (err) {
+        showAlert('danger', err.message);
+        saveBtn.disabled = false;
+      });
+    });
+
+    if (deleteBtn) {
+      deleteBtn.addEventListener('click', function () {
+        var email = emailField.value;
+        if (!deleteArmed) {
+          deleteArmed = true;
+          deleteBtn.textContent = '确认删除';
+          deleteBtn.classList.remove('btn-outline-danger');
+          deleteBtn.classList.add('btn-danger');
+          showAlert('warning', '删除后该会员的账号、报名和签到记录都会被移除，且无法恢复。再次点击“确认删除”继续。');
+          return;
+        }
+        clearTimeout(closeTimer);
+        hideAlert();
+        deleteBtn.disabled = true;
+        saveBtn.disabled = true;
+        fetch('/api/users/' + encodeURIComponent(email), {
+          method: 'DELETE'
+        }).then(function (res) {
+          return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+        }).then(function (r) {
+          if (!r.ok) throw new Error(r.body.message || '删除失败');
+          // Same contract as the save above: the including page owns whatever it
+          // rendered from this row and decides what to do with the news.
+          document.dispatchEvent(new CustomEvent('user-deleted', { detail: { email: email } }));
+          $(modal).modal('hide');
+        }).catch(function (err) {
+          showAlert('danger', err.message);
+          resetDelete();
+          saveBtn.disabled = false;
+        });
+      });
+    }
+  });
+</script>

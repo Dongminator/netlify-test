@@ -1,19 +1,174 @@
 <%- include('partials/header') %>
-<div class="pb-2 mt-2 mb-4 border-bottom"><h3>会员列表</h3></div>
-<table class="table table-striped">
-  <thead>
-    <tr><th>#</th><th>姓名</th><th>账号</th><th>场上位置</th><th>加入时间</th></tr>
-  </thead>
-  <tbody>
-    <% members.forEach((m, i) => { %>
-      <tr>
-        <td><%= i + 1 %></td>
-        <td><%= m.name %></td>
-        <td><%= m.email %></td>
-        <td><%= m.position %></td>
-        <td><%= m.joined %></td>
-      </tr>
-    <% }) %>
-  </tbody>
-</table>
+<% const isAdmin = !!(user && user.role === 'ADMIN'); %>
+<div class="page-head">
+  <h3>会员列表</h3>
+  <span class="page-head-sub">共 <%= members.length %> 位会员</span>
+  <% if (isAdmin) { %>
+    <button class="btn btn-brand ml-auto" type="button" data-toggle="modal" data-target="#bulk-add-modal">
+      <i class="fas fa-user-plus mr-1" aria-hidden="true"></i>
+      <span class="d-none d-sm-inline">批量添加会员</span>
+      <span class="d-sm-none">添加</span>
+    </button>
+  <% } %>
+</div>
+
+<div class="card-surface">
+  <div class="table-responsive">
+    <table class="table member-table">
+      <thead>
+        <tr>
+          <th class="d-none d-sm-table-cell">#</th>
+          <th>姓名</th>
+          <th class="d-none d-md-table-cell">账号</th>
+          <th>场上位置</th>
+          <th class="d-none d-md-table-cell">加入时间</th>
+          <% if (isAdmin) { %><th class="member-actions"><span class="sr-only">操作</span></th><% } %>
+        </tr>
+      </thead>
+      <tbody>
+        <% if (members.length === 0) { %>
+          <tr>
+            <td class="member-empty" colspan="<%= isAdmin ? 6 : 5 %>">还没有会员</td>
+          </tr>
+        <% } %>
+        <% members.forEach((m, i) => { %>
+          <tr data-email="<%= m.email %>">
+            <td class="member-index d-none d-sm-table-cell"><%= i + 1 %></td>
+            <td>
+              <span class="member-name"><%= m.name %></span>
+              <%# The 账号 column is hidden on phones, so carry the email here instead. %>
+              <div class="member-email-inline d-md-none"><%= m.email %></div>
+            </td>
+            <td class="member-account d-none d-md-table-cell"><%= m.email %></td>
+            <td>
+              <span class="position-badge member-position<%= m.position ? '' : ' is-empty' %>"><%= m.position || '—' %></span>
+            </td>
+            <td class="member-joined d-none d-md-table-cell"><%= m.joined %></td>
+            <% if (isAdmin) { %>
+              <td class="member-actions">
+                <button class="btn icon-btn edit-user"
+                        type="button"
+                        title="编辑"
+                        aria-label="编辑 <%= m.name %>"
+                        data-email="<%= m.email %>"
+                        data-name="<%= m.name %>"
+                        data-position="<%= m.position %>"
+                        data-role="<%= m.role %>"
+                        data-photo="<%= m.profilePhoto || '' %>">
+                  <i class="fas fa-pen" aria-hidden="true"></i>
+                </button>
+              </td>
+            <% } %>
+          </tr>
+        <% }) %>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<% if (user && user.role === 'ADMIN') { %>
+  <div class="modal fade" id="bulk-add-modal" tabindex="-1" role="dialog"
+       aria-labelledby="bulk-add-title" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
+      <div class="modal-content">
+        <form method="POST" action="/members/add-users">
+          <div class="modal-header">
+            <h5 class="modal-title" id="bulk-add-title">批量添加会员</h5>
+            <button type="button" class="close" data-dismiss="modal" aria-label="关闭">
+              <span aria-hidden="true">&times;</span>
+            </button>
+          </div>
+
+          <div class="modal-body">
+            <% if (results) { %>
+              <div class="card mb-3">
+                <div class="card-header">
+                  处理结果：成功 <%= results.filter(r => r.ok).length %> / <%= results.length %>
+                </div>
+                <ul class="list-group list-group-flush">
+                  <% if (results.length === 0) { %>
+                    <li class="list-group-item text-muted">没有可处理的内容</li>
+                  <% } %>
+                  <% results.forEach(r => { %>
+                    <li class="list-group-item <%= r.ok ? '' : 'list-group-item-danger' %>">
+                      <div class="text-monospace small"><%= r.ok ? r.email : r.line %></div>
+                      <span class="badge badge-<%= r.ok ? 'success' : 'danger' %>"><%= r.message %></span>
+                    </li>
+                  <% }) %>
+                </ul>
+              </div>
+            <% } %>
+
+            <div class="form-group mb-0">
+              <label for="users">每行一个账号，格式 <code>username:password</code></label>
+              <textarea class="form-control text-monospace" id="users" name="users" rows="8"
+                        placeholder="donglin@gsffc.org:donglin&#10;dike@gsffc.org:gsf2026"
+                        required><%= input %></textarea>
+              <small class="form-text text-muted">
+                <strong>存在的用户可在此页改密码</strong>：账号已存在时只更新密码，不会改动姓名和场上位置。
+                按第一个冒号拆分，密码本身可以包含冒号。空行和以 <code>#</code> 开头的行会被忽略。
+              </small>
+            </div>
+          </div>
+
+          <div class="modal-footer">
+            <button class="btn btn-secondary" type="button" data-dismiss="modal">取消</button>
+            <button class="btn btn-brand" type="submit">保存</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <%- include('partials/user-edit-modal', { editUserTitle: '编辑会员' }) %>
+
+  <script>
+    // Keep the table and the edit buttons in sync with what was just saved, so
+    // a second edit starts from the new values without a reload.
+    document.addEventListener('user-updated', function (e) {
+      var saved = e.detail.user;
+      var row = document.querySelector('tr[data-email="' + saved.email.replace(/"/g, '\\"') + '"]');
+      if (!row) return;
+      var position = saved.position || '';
+      row.querySelector('.member-name').textContent = saved.name;
+      var badge = row.querySelector('.member-position');
+      badge.textContent = position || '—';
+      badge.classList.toggle('is-empty', !position);
+      var btn = row.querySelector('.edit-user');
+      btn.dataset.name = saved.name;
+      btn.dataset.position = position;
+      btn.dataset.photo = saved.profilePhoto || '';
+      btn.setAttribute('aria-label', '编辑 ' + saved.name);
+    });
+
+    // Drop the deleted row instead of reloading, then renumber the rows below it
+    // and fix the count in the header — the # column is a position, not an id.
+    document.addEventListener('user-deleted', function (e) {
+      var row = document.querySelector('tr[data-email="' + e.detail.email.replace(/"/g, '\\"') + '"]');
+      if (!row) return;
+      var body = row.parentNode;
+      row.remove();
+      var rows = body.querySelectorAll('tr[data-email]');
+      rows.forEach(function (tr, i) {
+        tr.querySelector('.member-index').textContent = i + 1;
+      });
+      document.querySelector('.page-head-sub').textContent = '共 ' + rows.length + ' 位会员';
+      if (rows.length === 0) {
+        var empty = document.createElement('tr');
+        empty.innerHTML = '<td class="member-empty" colspan="6">还没有会员</td>';
+        body.appendChild(empty);
+      }
+    });
+  </script>
+
+  <% if (results) { %>
+    <script>
+      // Submitting re-renders the whole page, so reopen the modal to show the
+      // results. Waits for DOMContentLoaded: bootstrap's JS loads in the footer.
+      document.addEventListener('DOMContentLoaded', function () {
+        $('#bulk-add-modal').modal('show');
+      });
+    </script>
+  <% } %>
+<% } %>
 <%- include('partials/footer') %>

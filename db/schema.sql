@@ -1,6 +1,8 @@
 -- GSF demo: schema + seed data (PostgreSQL).
 -- All objects live in the hardcoded `gsffc` schema.
--- Executed on every server start; ON CONFLICT DO NOTHING keeps it idempotent.
+-- Nothing in the app runs this file — apply it by hand before the first run.
+-- ON CONFLICT DO NOTHING keeps it safe to re-apply to a fresh database; an
+-- database that predates the signup/check-in tables needs db/migrations/ instead.
 
 CREATE SCHEMA IF NOT EXISTS gsffc;
 
@@ -9,37 +11,116 @@ CREATE TABLE IF NOT EXISTS gsffc.users (
   password_hash TEXT NOT NULL,
   name          TEXT NOT NULL,
   position      TEXT,
-  joined        TEXT
+  joined        TEXT,
+  role          TEXT NOT NULL DEFAULT 'MEMBER' CHECK (role IN ('MEMBER', 'ADMIN')),
+  -- URL of the member's photo, e.g.
+  -- https://raw.githubusercontent.com/gsffc/gsffc.github.io/refs/heads/main/assets/img/teams/GSF/donglin.jpg
+  -- NULL falls back to the gravatar built from the email.
+  profile_photo TEXT
 );
 
+-- `start_at` and `end_at` replace the old `date` + free-text `time` pair.
+--
+-- TIMESTAMP *without* time zone, deliberately: a club schedule is a wall clock
+-- ("16:00 at the pitch"), not an instant, and it must not shift with whatever
+-- timezone the server happens to run in (UTC on Netlify, local in dev).
+-- TIMESTAMPTZ would convert on the way in and back out and move evening events
+-- across midnight. db.js remaps this type to a plain 'YYYY-MM-DDTHH:MM' string
+-- rather than a JS Date for the same reason — see the setTypeParser call there.
+--
+-- The app never stores seconds (the form is a minute-precision datetime-local),
+-- and the CHECK below is what keeps it that way, so two events at the same
+-- displayed time really are equal.
+--
+-- `date`, `endDate` and `time` still exist as read-only derived fields on the
+-- app's event object (db.js `rowToEvent`), which is why the calendar kept working.
 CREATE TABLE IF NOT EXISTS gsffc.events (
   id          TEXT PRIMARY KEY,
   title       TEXT NOT NULL,
-  date        TEXT NOT NULL,
-  time        TEXT,
+  start_at    TIMESTAMP NOT NULL,
+  end_at      TIMESTAMP NOT NULL,
   location    TEXT,
   lat         DOUBLE PRECISION,
   lng         DOUBLE PRECISION,
   description TEXT,
   capacity    INTEGER NOT NULL DEFAULT 0,
-  signups     TEXT NOT NULL DEFAULT '[]',
-  checkins    TEXT NOT NULL DEFAULT '[]',
-  checkin_radius INTEGER NOT NULL DEFAULT 10
+  checkin_radius INTEGER NOT NULL DEFAULT 10,
+  CONSTRAINT events_end_after_start CHECK (end_at > start_at)
 );
 
--- Upgrade path for databases
+-- One row per member per event. `signed_up_at` is both the audit trail and the
+-- ordering key: the roster is shown oldest-first, and the waitlist is served in
+-- that same order when a place frees up.
+--
+-- `status` is the "type" of the signup. A member joining a full event is
+-- recorded as WAITLIST and promoted to SIGNED_UP automatically — by a withdrawal
+-- (db.js `withdrawFromEvent`), by an admin raising `capacity` (`updateEvent`) or
+-- by a member being deleted (`deleteUser`). `promoted_at` records when that
+-- happened and stays NULL for a signup that was confirmed from the start.
+--
+-- `email` deliberately carries no foreign key to `users`: the seeds below (and
+-- the rosters of a database migrated from the old JSON columns) name members
+-- that may not have accounts yet. db.js `deleteUser` does the cascade by hand.
+CREATE TABLE IF NOT EXISTS gsffc.event_signups (
+  event_id     TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,
+  email        TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'SIGNED_UP' CHECK (status IN ('SIGNED_UP', 'WAITLIST')),
+  signed_up_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  promoted_at  TIMESTAMPTZ,
+  PRIMARY KEY (event_id, email)
+);
+
+-- One row per check-in. `checked_in_at` is the arrival time; the coordinates and
+-- the distance the server computed are kept as the evidence behind it (NULL for
+-- rows migrated from the old JSON column, where only the fact was recorded).
+-- A member may only check in while SIGNED_UP, and withdrawing deletes the row.
+CREATE TABLE IF NOT EXISTS gsffc.event_checkins (
+  event_id      TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,
+  email         TEXT NOT NULL,
+  checked_in_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  lat           DOUBLE PRECISION,
+  lng           DOUBLE PRECISION,
+  distance_m    INTEGER,
+  checked_in_by TEXT,
+  PRIMARY KEY (event_id, email)
+);
+
+-- Picking the next member off the waitlist, and counting the confirmed ones
+-- against `capacity`, are the two hot queries; both are (event_id, status)
+-- ordered by signup time.
+CREATE INDEX IF NOT EXISTS event_signups_queue_idx
+  ON gsffc.event_signups (event_id, status, signed_up_at);
+
+
+-- Bootstrap the first administrator by hand — there is no other way in:
+--   UPDATE gsffc.users SET role = 'ADMIN' WHERE email = 'you@example.com';
+
 -- Events with physical locations only (online events excluded for now).
-INSERT INTO gsffc.events (id, title, date, time, location, lat, lng, description, capacity, signups) VALUES
-  ('6a2a24a22e8d92aecd66b520', '周六例行训练赛 11v11', '2026-06-13', '16:00 - 18:00',
+INSERT INTO gsffc.events (id, title, start_at, end_at, location, lat, lng, description, capacity) VALUES
+  ('6a2a24a22e8d92aecd66b520', '周六例行训练赛 11v11', '2026-08-13T16:00', '2026-08-13T18:00',
    '2065 Tarob Ct, Milpitas, CA 95035', 37.4045892, -121.8907831,
-   '本周六例行训练赛，11人制对抗。请穿好球鞋护腿板，自带水。报名截止周五晚10点，人数不足改为小场。', 22,
-   '["dike@gsffc.org","kevin@gsffc.org","lifeng@gsffc.org","demo@gsffc.org","donglin@gsffc.org"]'),
-  ('8c4d46c44a0fb4caef88d742', '校联杯小组赛 GSF vs SBK', '2026-06-20', '14:00 - 16:00',
+   '本周六例行训练赛，11人制对抗。请穿好球鞋护腿板，自带水。报名截止周五晚10点，人数不足改为小场。', 22),
+  ('8c4d46c44a0fb4caef88d742', '校联杯小组赛 GSF vs SBK', '2026-08-20T14:00', '2026-08-20T16:00',
    'Stanford IM Field', 37.43053, -122.15917,
-   '校联杯小组赛第二轮，对阵老对手SBK。赛前30分钟到场热身，统一主场白色球衣。', 18,
-   '["dike@gsffc.org","lifeng@gsffc.org"]'),
-  ('5f1b13a11d7c81aabc55a409', '赛季总结烧烤聚会', '2026-05-30', '12:00 - 15:00',
+   '校联杯小组赛第二轮，对阵老对手SBK。赛前30分钟到场热身，统一主场白色球衣。', 18),
+  ('5f1b13a11d7c81aabc55a409', '赛季总结烧烤聚会', '2026-08-30T12:00', '2026-08-30T15:00',
    'Cuesta Park, Mountain View', 37.37758, -122.06965,
-   '春季赛季总结+烧烤，家属欢迎。俱乐部提供肉和饮料，可自带拿手菜。', 40,
-   '["dike@gsffc.org","kevin@gsffc.org","donglin@gsffc.org"]')
+   '春季赛季总结+烧烤，家属欢迎。俱乐部提供肉和饮料，可自带拿手菜。', 40)
 ON CONFLICT (id) DO NOTHING;
+
+-- Seed rosters, replacing the JSON arrays these three events used to carry. The
+-- offsets only exist to give the rows a stable order — the roster is sorted by
+-- `signed_up_at`, and equal timestamps would leave it arbitrary.
+INSERT INTO gsffc.event_signups (event_id, email, status, signed_up_at) VALUES
+  ('6a2a24a22e8d92aecd66b520', 'dike@gsffc.org',    'SIGNED_UP', now() - interval '5 days'),
+  ('6a2a24a22e8d92aecd66b520', 'kevin@gsffc.org',   'SIGNED_UP', now() - interval '4 days'),
+  ('6a2a24a22e8d92aecd66b520', 'lifeng@gsffc.org',  'SIGNED_UP', now() - interval '3 days'),
+  ('6a2a24a22e8d92aecd66b520', 'demo@gsffc.org',    'SIGNED_UP', now() - interval '2 days'),
+  ('6a2a24a22e8d92aecd66b520', 'donglin@gsffc.org', 'SIGNED_UP', now() - interval '1 day'),
+  ('8c4d46c44a0fb4caef88d742', 'dike@gsffc.org',    'SIGNED_UP', now() - interval '5 days'),
+  ('8c4d46c44a0fb4caef88d742', 'lifeng@gsffc.org',  'SIGNED_UP', now() - interval '4 days'),
+  ('5f1b13a11d7c81aabc55a409', 'dike@gsffc.org',    'SIGNED_UP', now() - interval '5 days'),
+  ('5f1b13a11d7c81aabc55a409', 'kevin@gsffc.org',   'SIGNED_UP', now() - interval '4 days'),
+  ('5f1b13a11d7c81aabc55a409', 'donglin@gsffc.org', 'SIGNED_UP', now() - interval '3 days')
+ON CONFLICT (event_id, email) DO NOTHING;
+

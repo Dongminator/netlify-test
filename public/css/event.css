@@ -1,0 +1,182 @@
+/* Event page — the stacked action list under the event details.
+   Phone first, like the production app: one full-width button per row separated
+   by hairlines, so every action is a comfortable thumb target and nothing has to
+   share a line. From `sm` up the buttons fall back to their natural width, since
+   a full-bleed bar across a desktop column looks broken. Tokens come from the
+   top of main.css. */
+
+/* Signup roster — avatar over name, auto-filled into as many columns as fit.
+   `auto-fill` rather than a fixed count so the same grid works in the narrow
+   md+ sidebar and across a full-width phone screen.
+
+   No card around it: the border plus `.card-body`'s padding was ~2rem of the
+   sidebar's width, i.e. a whole column of avatars. The count is a plain heading
+   with a hairline under it instead of a `.card-header`. */
+.roster-head {
+  padding-bottom: .5rem;
+  margin-bottom: .75rem;
+  border-bottom: 1px solid var(--gsf-line);
+  font-size: .9375rem;
+  color: var(--gsf-ink-soft);
+}
+
+.roster {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(4rem, 1fr));
+  gap: .875rem .25rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.roster-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0; /* grid items default to min-content; without this a long name widens the column */
+  text-align: center;
+}
+
+.roster-avatar {
+  position: relative;
+  display: block;
+}
+
+/* `object-fit` matters: a member's own profile_photo is an arbitrary URL at an
+   arbitrary aspect ratio, unlike the square gravatar fallback. */
+.roster-avatar img {
+  display: block;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--gsf-outside);
+  border: 1px solid var(--gsf-line);
+}
+
+.roster-avatar.is-checked-in img {
+  border-color: #28a745;
+  box-shadow: 0 0 0 2px rgba(40, 167, 69, .3);
+}
+
+.roster-tick {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  background: #28a745;
+  color: #fff;
+  font-size: .5rem;
+}
+
+/* A waitlisted member is on the same grid, one block below, but has no place at
+   the event yet — the avatar is dimmed and the tick badge's slot carries their
+   number in the queue instead. Dimming is `opacity` on the image alone, so the
+   badge and the name stay at full contrast. */
+.roster-avatar.is-waitlisted img {
+  opacity: .55;
+  border-style: dashed;
+}
+
+.roster-queue {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.125rem;
+  height: 1.125rem;
+  padding: 0 .1875rem;
+  border-radius: .5625rem;
+  border: 2px solid #fff;
+  background: var(--gsf-600);
+  color: #fff;
+  font-size: .625rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.roster-block-waitlist .roster-name {
+  color: var(--gsf-ink-soft);
+}
+
+/* Two lines, then clip: names run from "kzx" to "Xiangyu Meng" and a single
+   ellipsised line loses too much of the long ones. */
+.roster-name {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-top: .3125rem;
+  font-size: .75rem;
+  line-height: 1.25;
+  color: var(--gsf-600);
+  overflow-wrap: anywhere;
+}
+
+.roster-legend {
+  margin-top: 1rem;
+  font-size: .8125rem;
+  color: var(--gsf-ink-soft);
+}
+
+.roster-legend .fa-check {
+  color: #28a745;
+}
+
+.event-actions {
+  margin-top: 1.5rem;
+}
+
+.event-action {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem .75rem;
+  padding: .875rem 0;
+  border-top: 1px solid var(--gsf-line);
+}
+
+.event-action:last-child {
+  border-bottom: 1px solid var(--gsf-line);
+}
+
+/* The forms are only there to carry the POST; they must not add layout. */
+.event-action form {
+  width: 100%;
+  margin: 0;
+}
+
+.btn-action {
+  width: 100%;
+  padding-top: .625rem;
+  padding-bottom: .625rem;
+  font-size: 1.0625rem;
+}
+
+.event-action-note {
+  font-size: .9375rem;
+}
+
+@media (min-width: 576px) {
+  .event-action {
+    padding: .75rem 0;
+  }
+
+  .event-action form {
+    width: auto;
+  }
+
+  .btn-action {
+    width: auto;
+    min-width: 11rem;
+    font-size: 1rem;
+  }
+}
