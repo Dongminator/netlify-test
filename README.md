@@ -42,15 +42,15 @@ npm start
 - 🧪 测试设置（仅POC）：活动详情页右侧可直接修改该活动的签到点坐标和签到半径（也可点击地图选点、或一键填入自己当前位置），方便在任意位置测试GPS签到
 - `/member-list` 会员列表
 
-数据存储在 `data/db.json`（无需数据库）。原站 `/event/6a2a24a22e8d92aecd66b520` 对应的活动在本地同样可通过该id访问。
+数据存储在 PostgreSQL（表结构和种子数据见 `db/schema.sql`）。原站 `/event/6a2a24a22e8d92aecd66b520` 对应的活动在本地同样可通过该id访问。
 
-⚠️ 仅供本地测试：密码为明文存储，session secret硬编码。
+⚠️ 仅供测试：密码用 bcrypt 存储，session secret 默认值硬编码（生产请通过 `SESSION_SECRET` 覆盖）。
 
 ## 用手机测试签到
 
 浏览器定位API只在 **HTTPS 或 localhost** 下可用。手机直接访问 `http://<电脑IP>:3000` 会拿不到定位。可选方案：
 
 - 用 `ngrok http 3000`（或 cloudflared）生成 HTTPS 临时地址给手机访问
-- 或在电脑浏览器 DevTools 的 Sensors 面板模拟坐标进行测试（球场坐标见 `data/db.json`）
+- 或在电脑浏览器 DevTools 的 Sensors 面板模拟坐标进行测试（球场坐标见 `db/schema.sql`）
 
 另外手机GPS精度通常为5~20米，10米阈值在实际使用中可能偏严，可在活动详情页的"🧪 测试设置"中调大该活动的签到半径。

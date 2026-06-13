@@ -5,8 +5,10 @@ const bcrypt = require('bcryptjs');
 // The schema itself is provisioned manually from db/schema.sql — not by this code.
 const SCHEMA = 'gsffc';
 
+// Direct Postgres connection (Supabase or any Postgres). This must be a
+// Postgres connection string (postgres://...), NOT the Supabase REST API URL.
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || undefined
+  connectionString: process.env.DATABASE_URL || process.env.SUPABASE_DATABASE_URL || undefined
 });
 
 function rowToEvent(row) {
