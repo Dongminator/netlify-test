@@ -67,6 +67,16 @@
 
 .flash-banner i { color: #1f9254; }
 
+/* Same banner, deletion's colours: a green tick over "活动已删除" reads wrong. */
+.flash-banner.is-removed {
+  border-color: #f1c7c7;
+  border-left-color: #b02a37;
+  background: #fdf0f0;
+  color: #7a2029;
+}
+
+.flash-banner.is-removed i { color: #b02a37; }
+
 .flash-banner.is-leaving {
   opacity: 0;
   transform: translateY(-4px);

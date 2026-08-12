@@ -11,10 +11,17 @@
   <% } %>
 </div>
 
+<%# Both banners are the same element and the same script — only one of the two
+    flags is ever set, since each comes from its own redirect. %>
 <% if (created) { %>
   <div class="flash-banner" id="created-banner" role="status">
     <i class="fas fa-check-circle" aria-hidden="true"></i>
     <span>活动已创建，已显示在下面的日历上。</span>
+  </div>
+<% } else if (deleted) { %>
+  <div class="flash-banner is-removed" id="created-banner" role="status">
+    <i class="fas fa-trash" aria-hidden="true"></i>
+    <span>活动已删除，报名和签到记录已一并清除。</span>
   </div>
 <% } %>
 
@@ -67,8 +74,9 @@
 
 <script>
   (function () {
-    // The success banner is raised by ?created=1 after the modal reloads the
-    // page onto the new event's month; it closes itself 5 seconds later.
+    // The banner is raised by ?created=1 after the modal reloads the page onto
+    // the new event's month, or by ?deleted=1 after an event was deleted from
+    // its own page; either way it closes itself 5 seconds later.
     var banner = document.getElementById('created-banner');
     if (!banner) return;
     setTimeout(function () { banner.classList.add('is-leaving'); }, 5000);

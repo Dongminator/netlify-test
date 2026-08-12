@@ -1,11 +1,13 @@
 <%- include('partials/header') %>
 <% const isAdmin = user && user.role === 'ADMIN'; %>
-<%# Start and end are stored as 'YYYY-MM-DDTHH:MM', so the clock half is a slice.
-    The end repeats its date only when the event runs past midnight — otherwise
-    "2026-06-13 16:00 - 18:00" says it. %>
+<%# Start and end are stored as 'YYYY-MM-DDTHH:MM', so both halves are slices:
+    the date is rendered m/dd/yy (the club's display format everywhere) and the
+    clock is taken as-is. The end repeats its date only when the event runs past
+    midnight — otherwise "6/13/26 16:00 - 18:00" says it. %>
 <% const clock = at => at.slice(11, 16); %>
-<% const whenLabel = event.date + ' ' + clock(event.startAt) + ' - '
-     + (event.endDate === event.date ? '' : event.endDate + ' ') + clock(event.endAt); %>
+<% const mdy = at => Number(at.slice(5, 7)) + '/' + at.slice(8, 10) + '/' + at.slice(2, 4); %>
+<% const whenLabel = mdy(event.startAt) + ' ' + clock(event.startAt) + ' - '
+     + (event.endDate === event.date ? '' : mdy(event.endAt) + ' ') + clock(event.endAt); %>
 <div class="pb-2 mt-2 mb-4 border-bottom">
   <h3 class="mb-0"><%= event.title %>
     <% if (isPast) { %><span class="badge badge-secondary">已结束</span><% } %>
@@ -35,9 +37,21 @@
           <span class="badge badge-success p-2">✓ 已到场签到<% if (myCheckinAt) { %> · <%= myCheckinAt %><% } %></span>
         <% } else { %>
           <div id="field-map" class="rounded border mb-2" style="height: 260px;"></div>
-          <div id="position-status" class="mb-2 text-muted">正在获取你的位置…</div>
-          <button class="btn btn-success" id="checkin-btn" type="button" disabled>📍 到场签到</button>
-          <small class="text-muted ml-2">进入绿圈（球场 <%= event.checkinRadius %> 米范围）后即可签到</small>
+          <div id="position-status" class="mb-3 text-muted">正在获取你的位置…</div>
+          <%# The button and the reason it is disabled sit on one row from `sm`
+              up and stack on a phone. Both halves are rewritten by the script on
+              every countdown tick and every position fix — what is rendered here
+              is only the state at page load, so the row never appears empty. %>
+          <div class="checkin-action">
+            <button class="btn btn-success btn-checkin" id="checkin-btn" type="button" disabled>📍 到场签到</button>
+            <div class="checkin-hint" id="checkin-hint">
+              <% if (serverNow < checkinOpensAt) { %>
+                签到将在活动开始前 1 小时开放
+              <% } else { %>
+                正在获取你的位置…
+              <% } %>
+            </div>
+          </div>
           <div id="checkin-msg" class="mt-2"></div>
         <% } %>
       </div>
@@ -171,11 +185,50 @@
         <i class="fas fa-plus mr-1" aria-hidden="true"></i>复制
       </button>
     </div>
+    <%# Deleting takes the roster with it, so it is confirmed in a modal rather
+        than the inline confirm() 清空报名 uses: on a phone a native dialog is a
+        one-line question with no room to spell out what is lost. The modal *is*
+        the confirmation — its 确认删除 button submits the form it contains, so
+        no arming step and no script. %>
+    <div class="event-action">
+      <button class="btn btn-outline-danger btn-action" type="button"
+              data-toggle="modal" data-target="#delete-event-modal">
+        <i class="fas fa-trash mr-1" aria-hidden="true"></i>删除活动
+      </button>
+    </div>
   <% } %>
 </div>
 
 <% if (isAdmin) { %>
   <%- include('partials/event-modal', { formEvent: event, defaultDate: event.date }) %>
+
+  <div class="modal fade" id="delete-event-modal" tabindex="-1" role="dialog"
+       aria-labelledby="delete-event-title" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="delete-event-title">删除活动</h5>
+          <button class="close" type="button" data-dismiss="modal" aria-label="关闭">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
+        <div class="modal-body">
+          <p class="mb-2">确定删除活动<strong>「<%= event.title %>」</strong>（<%= whenLabel %>）吗？</p>
+          <div class="alert alert-danger mb-0" role="alert">
+            该活动的全部报名、候补名单和签到记录都会一并删除，此操作无法撤销。
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" type="button" data-dismiss="modal">取消</button>
+          <%# Admin-only route: requireAdmin re-reads the role, the `isAdmin`
+              local above only decides what renders. %>
+          <form method="POST" action="/event/<%= event.id %>/delete">
+            <button class="btn btn-danger" type="submit">确认删除</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
 <% } %>
 
 <% if (signedUp && !checkedIn && !isPast && event.coords) { %>
@@ -186,9 +239,66 @@
     var btn = document.getElementById('checkin-btn');
     var msg = document.getElementById('checkin-msg');
     var status = document.getElementById('position-status');
+    var hint = document.getElementById('checkin-hint');
     var lastPos = null;
     var userMarker = null;
     var accuracyCircle = null;
+
+    // The two gates on the button: the check-in window opens an hour before
+    // kick-off, and the member has to be inside the field's radius. `OPENS_AT`
+    // is the same absolute instant the route checks, and the clock it is
+    // compared against is the server's — a phone running a few minutes fast
+    // would otherwise enable a button the route refuses.
+    var OPENS_AT = <%= checkinOpensAt %>;
+    var SKEW = <%= serverNow %> - Date.now();
+    var LABEL = '📍 到场签到';
+    var inside = null;      // null until the first position fix lands
+    var locError = '';      // set when there will be no fix at all
+    var submitting = false; // a POST is in flight; the ticker must not undo it
+    var ticker = null;
+
+    function now() { return Date.now() + SKEW; }
+    function pad(n) { return n < 10 ? '0' + n : String(n); }
+
+    function countdown(ms) {
+      var total = Math.max(0, Math.ceil(ms / 1000));
+      var hms = pad(Math.floor(total / 3600) % 24) + ':'
+        + pad(Math.floor(total / 60) % 60) + ':' + pad(total % 60);
+      var days = Math.floor(total / 86400);
+      return days ? days + ' 天 ' + hms : hms;
+    }
+
+    // Single source of truth for the button: called on every tick, every
+    // position fix and after a failed submit, never from two places at once.
+    function render() {
+      if (submitting) return;
+      var left = OPENS_AT - now();
+      if (left > 0) {
+        btn.disabled = true;
+        btn.classList.remove('is-ready');
+        hint.className = 'checkin-hint';
+        hint.innerHTML = '签到将在活动开始前 1 小时开放 · 还有 '
+          + '<span class="checkin-countdown">' + countdown(left) + '</span>';
+        return;
+      }
+      // Open from here on, so the countdown has nothing left to do — position
+      // fixes drive the rest.
+      if (ticker) { clearInterval(ticker); ticker = null; }
+      if (locError) {
+        btn.disabled = true;
+        btn.classList.remove('is-ready');
+        hint.className = 'checkin-hint text-danger';
+        hint.textContent = locError;
+        return;
+      }
+      var ready = inside === true;
+      btn.disabled = !ready;
+      btn.classList.toggle('is-ready', ready);
+      hint.className = 'checkin-hint' + (ready ? ' is-ready' : '');
+      hint.textContent = ready ? '✓ 你已到达球场，现在可以签到'
+        : inside === null ? '正在获取你的位置…'
+        : '到达球场后即可签到';
+    }
 
     var map = L.map('field-map').setView([FIELD.lat, FIELD.lng], 17);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -229,27 +339,42 @@
         accuracyCircle.setLatLng([lat, lng]).setRadius(pos.coords.accuracy);
       }
       var d = Math.round(distanceMeters(lat, lng, FIELD.lat, FIELD.lng));
-      var inside = d <= RADIUS;
-      btn.disabled = !inside;
-      status.className = 'mb-2 ' + (inside ? 'text-success font-weight-bold' : 'text-muted');
+      inside = d <= RADIUS;
+      locError = '';
+      // The line under the map is the distance readout; whether the button is
+      // usable, and why, is the hint beside it.
+      status.className = 'mb-3 ' + (inside ? 'text-success font-weight-bold' : 'text-muted');
       status.textContent = inside
-        ? '✓ 已进入签到范围（距中心 ' + d + ' 米），可以签到'
+        ? '✓ 已进入签到范围（距中心 ' + d + ' 米）'
         : '距签到点 ' + d + ' 米，进入绿圈后可签到（定位精度 ±' + Math.round(pos.coords.accuracy) + ' 米）';
+      render();
     }
 
     if (!navigator.geolocation) {
-      status.textContent = '当前浏览器不支持定位，无法签到';
-      status.className = 'mb-2 text-danger';
+      locError = '当前浏览器不支持定位，无法签到';
+      status.textContent = locError;
+      status.className = 'mb-3 text-danger';
     } else {
       navigator.geolocation.watchPosition(onPosition, function (err) {
         status.textContent = '无法获取位置：' + err.message + '（请允许定位权限后刷新页面）';
-        status.className = 'mb-2 text-danger';
+        status.className = 'mb-3 text-danger';
+        // Only fatal while nothing has been received: a dropped fix mid-session
+        // leaves the last known state alone rather than pulling the button.
+        if (inside === null) {
+          locError = '无法获取位置，请允许定位权限后刷新页面';
+          render();
+        }
       }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 });
     }
 
+    render();
+    if (OPENS_AT - now() > 0) ticker = setInterval(render, 1000);
+
     btn.addEventListener('click', function () {
-      if (!lastPos) return;
+      if (!lastPos || btn.disabled) return;
+      submitting = true;
       btn.disabled = true;
+      btn.classList.remove('is-ready');
       btn.textContent = '签到中…';
       fetch('/event/<%= event.id %>/checkin', {
         method: 'POST',
@@ -264,14 +389,16 @@
           if (data.ok) {
             setTimeout(function () { location.reload(); }, 1200);
           } else {
-            btn.disabled = false;
-            btn.textContent = '📍 到场签到';
+            submitting = false;
+            btn.textContent = LABEL;
+            render();
           }
         });
       }).catch(function () {
         show('网络错误，请重试', false);
-        btn.disabled = false;
-        btn.textContent = '📍 到场签到';
+        submitting = false;
+        btn.textContent = LABEL;
+        render();
       });
     });
   })();

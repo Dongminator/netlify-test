@@ -72,9 +72,10 @@ instants and keep their `Date` parsing. Two `CHECK`s hold the shape: `end_at > s
 them — `date`, `endDate` and `time` (`'16:00 - 18:00'`, the exact shape the old free-text column had,
 which is why the calendar chip and its tooltip needed no rewrite). Same arrangement as
 `signups`/`checkins` over `roster`: nothing writes through them, and they are deliberately absent from
-`EDITABLE_FIELDS`. `event.date` is still what the calendar groups by and what is compared lexically
-against the `todayStr()` helper (`new Date().toISOString().slice(0,10)`) to decide past vs. upcoming —
-that test is still **day-granular**, so an event stays "upcoming" until the day after it ends. Since
+`EDITABLE_FIELDS`. `event.date` is what the calendar groups by and what is compared lexically against
+the `todayStr()` helper to decide which days are past. Whether a single *event* is over is no longer
+day-granular: `hasEnded(event)` compares `clubEpoch(event.endAt)` against now, so 已结束 and the closed
+check-in both land on the minute the event ends (see the timezone section under check-in). Since
 `startAt`/`endAt` are fixed-width and identically formatted, every comparison on them (ordering,
 end-after-start, in SQL and in JS and in the browser) is a plain string comparison.
 
@@ -225,8 +226,7 @@ square gravatar; the gravatar fallback is requested at `s=144` for a 48px box, i
 phone screen, so changing the CSS size means revisiting that number in `/event/:id` **and** the
 `width`/`height` attributes on the `<img>` in [views/event.ejs](views/event.ejs). The grid has room for
 a name and nothing else, so the two timestamps ride in the `title` tooltip — `server.js`'s `formatStamp`
-renders them (local time, minute precision, year dropped when it is this year) and the template never
-sees a raw `Date`.
+renders them (club-local, `m/dd/yy HH:MM`, see below) and the template never sees a raw `Date`.
 
 **候补名单 is a second copy of that grid**, below the roster and rendered only when somebody is waiting.
 Same markup, three differences: the avatar is dimmed (`.is-waitlisted`, `opacity` on the `<img>` alone so
@@ -239,7 +239,7 @@ all four posting to the same two routes, since `withdraw` deletes whichever kind
 
 **Event page actions.** Everything the page can do is one divider-separated stack of full-width buttons
 (`.event-actions` in [public/css/event.css](public/css/event.css)), mirroring the production app:
-报名/取消报名 for everyone, then 编辑活动, 清空报名 and 复制 for admins only. The title row
+报名/取消报名 for everyone, then 编辑活动, 清空报名, 复制 and 删除活动 for admins only. The title row
 carries no buttons. The stack sits **outside and after the `.row`**, not inside the `col-md-8` details
 column, so it lands below the roster in both layouts — details beside the roster on `md+`, then
 details → roster → buttons stacked on a phone. Moving it back into a column puts the buttons above the
@@ -254,7 +254,23 @@ from this event, the date a week on, editable before it is saved — so the copy
 `POST /api/events` (`requireAdminApi`) landing on the new event page. The copy starts with a fresh id and
 an empty roster because `createEvent` only writes the event row; the roster is not part of the form.
 The old `POST /event/:id/copy-next-week` route and the server's `addDays` helper are gone with it, as
-is the `nextWeekDate` render local. There is still no delete route.
+is the `nextWeekDate` render local.
+
+**删除活动 is the one destructive action confirmed in a modal, not an `onsubmit` `confirm()`.**
+`#delete-event-modal` lives at the bottom of [views/event.ejs](views/event.ejs) beside the event modal
+and renders only for admins; it needs no script, because the dialog *is* the confirmation — its 确认删除
+button is inside the `<form>` that POSTs to `/event/:id/delete` (`requireAdmin`, which re-reads the
+role). 清空报名 keeps its native `confirm()`; deleting takes the whole event with it, and a phone's
+one-line native dialog has no room to say what is lost. That form is a flex item in `.modal-footer`, so
+`event.css` gives **the form** the full-width treatment members.css only applies to direct `.btn`
+children below `sm` — a new footer button wrapped in a form needs the same.
+
+`db.deleteEvent` is a single `DELETE … RETURNING *`: unlike `deleteUser`, `event_signups` and
+`event_checkins` really do carry `REFERENCES gsffc.events(id) ON DELETE CASCADE`, so there is nothing to
+cascade by hand and no waitlist left to promote. It returns the deleted event so the route knows which
+month to send the admin back to — `/calendar?month=…&deleted=1`, the mirror of `?created=1`, raising the
+same banner in red (`.flash-banner.is-removed`) through the same 5-second script. A second delete of the
+same id returns `null` and the route answers 404.
 
 **Check-in flow.** Browser `watchPosition` → `POST /event/:id/checkin` with `{lat, lng}` →
 server recomputes haversine distance against `event.coords` and rejects beyond `event.checkinRadius`.
@@ -267,6 +283,47 @@ reads the member's own `event.roster` entry, so a **waitlisted** member is refus
 arrive at yet) as distinctly from one who never signed up. Withdrawing deletes the check-in with the
 signup. `event_checkins.checked_in_by` exists in the schema for an admin checking somebody else in;
 nothing writes it yet.
+
+**The check-in window opens an hour before kick-off** (`CHECKIN_LEAD_MS`) and closes when the event
+ends. `checkinOpensAt(event)` is that first instant and both the route and the page use it, so the
+button and the server agree on when it opens; `hasEnded(event)` closes it. A malformed `startAt` makes
+`checkinOpensAt` `NaN`, and both gates then fall back to distance alone.
+
+**One timezone, named once.** `start_at`/`end_at` are naive wall clocks and the process runs in **UTC**
+on Netlify, so turning one into an instant needs a zone: `CLUB_TIMEZONE` (env, default
+`America/Los_Angeles`). **Set it if the club is not in California** — check-in windows and 已结束 would
+otherwise be hours off. `zoneOffset(epoch)` asks `Intl` for the offset *at that instant*, which is what
+makes everything below DST-aware rather than a fixed number, and three helpers are built on it:
+`clubEpoch(wall)` (wall clock → epoch, looking the offset up twice because it depends on the very
+instant being solved for, so a DST boundary lands right), `todayStr()` (today's YYYY-MM-DD in the club's
+zone) and `formatStamp()` (a real `TIMESTAMPTZ` → club-local text). **Nothing may go back to
+`new Date().toISOString().slice(0,10)` for "today", or to `getHours()`/`getMonth()` for display.** Both
+read the *process's* zone: `toISOString` is UTC, so after 17:00 in California "today" was already
+tomorrow and an event hours away was rendered 已结束 — and on Netlify a 22:23 check-in was shown to the
+member as 05:23. The calendar route derives its current year/month from `todayStr()` for the same
+reason (in UTC, a December evening in California is next January).
+
+**One display format for a date and time: `m/dd/yy HH:MM`** — month unpadded, day padded, two-digit
+year, 24-hour clock (`8/12/26 23:04`). It is short enough for a phone, which is what the whole page is
+sized for. `formatStamp` emits it for real timestamps, and `event.ejs`'s `mdy` helper slices it out of
+the `'YYYY-MM-DDTHH:MM'` wall clocks for the 时间 row; **an end on the same day as the start shows only
+its clock** (`8/12/26 21:00 - 23:04`), and repeats the date only when the event runs past midnight. This
+is the display shape only — stored values, the JSON API and the `datetime-local` inputs all stay
+`YYYY-MM-DDTHH:MM`, and `event.date`/`todayStr()` stay `YYYY-MM-DD` because they are *compared*
+lexically, not read. `users.joined` is free-text TEXT and is rendered as stored.
+
+The button has exactly two gates and one renderer. `render()` in [views/event.ejs](views/event.ejs)
+is the only thing that writes `disabled`, the pulse class or the hint beside it, and it is called from
+the 1-second ticker, from every position fix and after a failed POST — never from two places at once.
+Its states are: before the window, disabled with a live countdown; open but outside the radius (or with
+no fix yet), disabled with 到达球场后即可签到; open and inside, enabled with the `is-ready` pulse. The
+ticker stops the moment the window opens, position fixes drive it from there, and a `submitting` flag
+keeps it from re-enabling the button under an in-flight request. Times are compared against the
+server's clock, not the phone's: `SKEW` is the difference measured at render, so a phone running fast
+can't be shown a button the route will refuse. The line under the map stays a pure distance readout —
+whether the button is usable, and why, is the hint. The `is-ready` pulse is an animated `box-shadow`
+rather than a scaled pseudo-element, because a shadow paints outside the box without widening it: a
+full-width button on a 320px screen would otherwise push the page into horizontal scroll.
 
 **Async errors.** Express 4 doesn't catch rejected promises, so every async route is wrapped in the
 `wrap()` helper. New async routes must use it or failures will hang the request.
@@ -407,7 +464,9 @@ the 删除用户 button, which only renders for admins.
 - Creating an event is admin-only, and the "编辑" button only renders for admins, but the route behind it
   (`PUT /api/events/:id`) is still `requireLoginApi` — **any** logged-in member can edit any event by
   calling it directly, which now includes raising `capacity` to promote themselves off the waitlist.
-  There is no delete route at all.
+  `POST /event/:id/delete` *is* `requireAdmin`, but it deletes the event and its whole roster
+  irreversibly, with no soft-delete and no record of who did it — the same shape as deleting a member.
+  There is no JSON delete endpoint under `/api/events/:id`.
 - **Being promoted off the waitlist is silent.** There is no mail, no push, nothing: the member finds
   out by opening the event page. Nothing displays `promoted_at` either, though it is recorded.
 - A signup carries no cut-off. `POST /event/:id/signup` will still take a signup for an event whose date

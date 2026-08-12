@@ -509,9 +509,23 @@ async function updateEvent(event) {
   });
 }
 
+// Admin "删除活动": the event row and everything hanging off it. No lock and no
+// hand-rolled cascade — unlike `users`, both roster tables carry a real
+// `REFERENCES gsffc.events(id) ON DELETE CASCADE`, so the signups, the waitlist
+// and the check-ins go with the row in the same statement. There is no waitlist
+// to promote afterwards: the event it queued for no longer exists.
+// Returns the deleted event (so the caller knows which month to go back to), or
+// null when there was no such event.
+async function deleteEvent(id) {
+  const { rows } = await pool.query(
+    `DELETE FROM ${SCHEMA}.events WHERE id = $1 RETURNING *`, [id]
+  );
+  return rows[0] ? rowToEvent(rows[0]) : null;
+}
+
 module.exports = {
   pool, ROLES, MEMBER, ADMIN, SIGNED_UP, WAITLIST,
   getUsers, getUserByEmail, verifyPassword, createUser, upsertUser, updateUser, deleteUser,
-  getEvents, getEvent, createEvent, updateEvent,
+  getEvents, getEvent, createEvent, updateEvent, deleteEvent,
   signUpForEvent, withdrawFromEvent, clearEventRoster, checkInToEvent
 };

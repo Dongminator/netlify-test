@@ -120,20 +120,75 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-// `event.date` is a plain YYYY-MM-DD string, so "today" is produced in the same
-// shape and every past/upcoming test is a lexical comparison.
-const todayStr = () => new Date().toISOString().slice(0, 10);
+// Event times are stored as a naive wall clock ('YYYY-MM-DDTHH:MM') because the
+// club reads them as its own local time — but the process may well be running in
+// UTC (it is, on Netlify), so a wall clock is not yet an instant. `CLUB_TIMEZONE`
+// is the zone they are read in, and everything that compares an event against
+// `Date.now()` — or renders a real timestamp — goes through the helpers below.
+// Set it if the club is not in California.
+const CLUB_TIMEZONE = process.env.CLUB_TIMEZONE || 'America/Los_Angeles';
+
+// Offset in ms between the club's wall clock and UTC at a given instant — which
+// is what makes this DST-aware rather than a fixed number.
+function zoneOffset(epoch) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: CLUB_TIMEZONE,
+    hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).formatToParts(new Date(epoch)).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+  const asUTC = Date.UTC(+parts.year, +parts.month - 1, +parts.day,
+    +parts.hour % 24, +parts.minute, +parts.second);
+  return asUTC - epoch;
+}
+
+// 'YYYY-MM-DDTHH:MM' read in the club's zone -> epoch ms, NaN if unparseable.
+// The offset is looked up twice because it depends on the very instant being
+// solved for: the first pass is a guess, the second lands it on the right side
+// of a DST change.
+function clubEpoch(wall) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(String(wall || ''));
+  if (!m) return NaN;
+  const guess = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+  return guess - zoneOffset(guess - zoneOffset(guess));
+}
+
+// "Today" in the club's zone, in the same YYYY-MM-DD shape as `event.date`, so
+// every past/upcoming test stays a lexical comparison. It is emphatically *not*
+// `new Date().toISOString()`: that is today in **UTC**, which after 17:00 in
+// California is already tomorrow — an evening event was marked 已结束 while it
+// was still hours away.
+const clubDate = epoch => new Date(epoch + zoneOffset(epoch)).toISOString().slice(0, 10);
+const todayStr = () => clubDate(Date.now());
+
+// An event is over when it *ends*, not when its date rolls over: with the end
+// time now stored, "已结束" and the closed check-in can both be exact. Falls
+// back to the date if `endAt` is unparseable.
+function hasEnded(event) {
+  const end = clubEpoch(event.endAt);
+  return Number.isFinite(end) ? end < Date.now() : event.date < todayStr();
+}
+
+// Check-in opens an hour before kick-off and closes when the event ends, the
+// same instant that raises the 已结束 badge. The page counts down to this one,
+// so the button and the route agree on when it opens.
+const CHECKIN_LEAD_MS = 60 * 60 * 1000;
+const checkinOpensAt = event => clubEpoch(event.startAt) - CHECKIN_LEAD_MS;
 
 // Signup and check-in times are real timestamps (unlike `event.date`), so they
-// are formatted here rather than in the template: local time, minute precision,
-// and the year dropped when it is the current one — the roster is a list of
-// "when did this happen" notes, not a log.
+// are formatted here rather than in the template: club-local time, minute
+// precision, in the app's one display shape — `m/dd/yy HH:MM`, the same one the
+// event page's 时间 row uses. The shift is what makes them club-local:
+// `getHours()` would read them in the *process's* zone, which is UTC on Netlify,
+// and a 22:23 check-in would be shown to the member as 05:23.
 function formatStamp(value) {
   if (!value) return '';
   const d = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(d.getTime())) return '';
-  const md = `${d.getMonth() + 1}月${d.getDate()}日 ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-  return d.getFullYear() === new Date().getFullYear() ? md : `${d.getFullYear()}年${md}`;
+  const local = new Date(d.getTime() + zoneOffset(d.getTime()));
+  return `${local.getUTCMonth() + 1}/${pad2(local.getUTCDate())}/`
+    + `${String(local.getUTCFullYear()).slice(2)} `
+    + `${pad2(local.getUTCHours())}:${pad2(local.getUTCMinutes())}`;
 }
 
 // Fallback centre for the add-event picker map when no event has coords yet.
@@ -204,9 +259,12 @@ app.get('/calendar', requireLogin, wrap(async (req, res) => {
   const today = todayStr();
 
   // ?month=YYYY-MM drives the grid; anything malformed falls back to this month.
-  const now = new Date();
-  let year = now.getFullYear();
-  let month = now.getMonth();
+  // "This month" comes out of the club-local date, not the process's own clock —
+  // in UTC a December evening in California is already next year's January.
+  const thisYear = Number(today.slice(0, 4));
+  const thisMonth = Number(today.slice(5, 7)) - 1;
+  let year = thisYear;
+  let month = thisMonth;
   const requested = /^(\d{4})-(\d{2})$/.exec(req.query.month || '');
   if (requested) {
     const y = Number(requested[1]);
@@ -230,14 +288,17 @@ app.get('/calendar', requireLogin, wrap(async (req, res) => {
     monthLabel: `${year}年${month + 1}月`,
     prevMonth: `${prev.getFullYear()}-${pad2(prev.getMonth() + 1)}`,
     nextMonth: `${next.getFullYear()}-${pad2(next.getMonth() + 1)}`,
-    isCurrentMonth: year === now.getFullYear() && month === now.getMonth(),
+    isCurrentMonth: year === thisYear && month === thisMonth,
     // The add-event modal reloads onto the new event's month with ?created=1,
     // which is what raises the success banner.
     created: req.query.created === '1',
+    // Same idea for the other direction: POST /event/:id/delete sends the admin
+    // back here, onto the month the deleted event was in, with ?deleted=1.
+    deleted: req.query.deleted === '1',
     mapCenter,
     // What the modal's date field starts on: today when it is in view, so the
     // common case needs no picking, otherwise the 1st of the month being viewed.
-    defaultDate: year === now.getFullYear() && month === now.getMonth() ? today : ymd(year, month, 1)
+    defaultDate: year === thisYear && month === thisMonth ? today : ymd(year, month, 1)
   });
 }));
 
@@ -286,7 +347,13 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     myCheckinAt: formatStamp(mine && mine.checkedInAt),
     // Set by the redirect from POST /event/:id/signup when the event was full.
     joinedWaitlist: req.query.joined === 'waitlist',
-    isPast: event.date < todayStr()
+    isPast: hasEnded(event),
+    // The check-in window, as an absolute instant, plus the clock the server
+    // measured it against: the page counts down against `Date.now()` corrected
+    // by the difference, so a phone whose clock is off doesn't offer a button
+    // the route will refuse (or hide one it would accept).
+    checkinOpensAt: checkinOpensAt(event),
+    serverNow: Date.now()
   });
 }));
 
@@ -318,6 +385,16 @@ app.post('/event/:id/clear-signups', requireAdmin, wrap(async (req, res) => {
   res.redirect(`/event/${req.params.id}`);
 }));
 
+// Delete an event outright. Admin-only and irreversible — the roster goes with
+// it through the tables' ON DELETE CASCADE. The event page it was invoked from
+// is gone, so it lands on the calendar showing the month the event was in, with
+// ?deleted=1 raising the banner there.
+app.post('/event/:id/delete', requireAdmin, wrap(async (req, res) => {
+  const deleted = await db.deleteEvent(req.params.id);
+  if (!deleted) return res.status(404).render('404', { title: 'Not Found' });
+  res.redirect(`/calendar?month=${deleted.date.slice(0, 7)}&deleted=1`);
+}));
+
 // Copying an event no longer has a route of its own: the 复制 button opens the
 // event modal prefilled and a week on, so the copy goes through POST /api/events
 // like any other creation — with the admin able to adjust it before it is saved.
@@ -326,7 +403,7 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
   const event = await db.getEvent(req.params.id);
   if (!event) return res.status(404).json({ ok: false, message: '活动不存在' });
   if (!event.coords) return res.status(400).json({ ok: false, message: '该活动为线上活动，无需到场签到' });
-  if (event.date < todayStr()) {
+  if (hasEnded(event)) {
     return res.status(400).json({ ok: false, message: '活动已结束，无法签到' });
   }
   const email = req.session.user.email;
@@ -341,6 +418,16 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
   }
   if (mine.checkedInAt) {
     return res.json({ ok: true, message: '你已签到过了' });
+  }
+  // Too early. The button is disabled until this instant as well, so hitting
+  // this means either a hand-rolled request or a browser clock running fast.
+  const opensAt = checkinOpensAt(event);
+  if (Number.isFinite(opensAt) && Date.now() < opensAt) {
+    return res.status(403).json({
+      ok: false,
+      opensAt,
+      message: '签到尚未开放：活动开始前 1 小时才能签到'
+    });
   }
   const lat = Number(req.body.lat);
   const lng = Number(req.body.lng);
