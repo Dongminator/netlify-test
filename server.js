@@ -20,6 +20,51 @@ app.set('views', viewsDir);
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Express 4 doesn't catch async errors; route rejections go to the error handler
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// Page locals, set *before* the session store. The 500 handler at the bottom
+// renders 404.ejs, and header.ejs reads `path` and `user` — so a failure inside
+// the session store (an unreachable database, most often) used to throw
+// "path is not defined" from the template and bury the real cause. These are the
+// safe defaults; the middleware after session() fills in the signed-in user.
+app.use((req, res, next) => {
+  res.locals.user = null;
+  res.locals.path = req.path;
+  next();
+});
+
+// Deployment smoke test, mounted before the session middleware so it still
+// answers when the session store is exactly what is broken. Reports whether the
+// function can reach Postgres and see the gsffc schema, and never echoes the
+// password back.
+app.get('/healthz', wrap(async (req, res) => {
+  const url = process.env.DATABASE_URL || process.env.SUPABASE_DATABASE_URL || '';
+  const out = { ok: false, databaseUrlSet: Boolean(url), clubTimezone: CLUB_TIMEZONE };
+  try {
+    const parsed = new URL(url);
+    out.host = parsed.hostname;
+    out.port = parsed.port || '5432';
+    out.database = parsed.pathname.replace(/^\//, '');
+    out.username = parsed.username;
+    out.sslmode = parsed.searchParams.get('sslmode') || null;
+  } catch {
+    out.urlParseError = 'DATABASE_URL is not a valid postgres:// URL';
+  }
+  try {
+    const { rows } = await db.pool.query(
+      "select current_database() as db, (select count(*) from information_schema.tables where table_schema = 'gsffc') as gsffc_tables"
+    );
+    out.ok = true;
+    out.connectedTo = rows[0].db;
+    out.gsffcTables = Number(rows[0].gsffc_tables);
+  } catch (err) {
+    out.error = { message: err.message, code: err.code, syscall: err.syscall, address: err.address };
+  }
+  res.status(out.ok ? 200 : 503).json(out);
+}));
+
 app.use(session({
   store: new PgSession({
     pool: db.pool,
@@ -32,9 +77,6 @@ app.use(session({
   rolling: true,
   cookie: { maxAge: 30 * 24 * 60 * 60 * 1000 } // stay signed in for 30 days
 }));
-
-// Express 4 doesn't catch async errors; route rejections go to the error handler
-const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 app.use(wrap(async (req, res, next) => {
   // Sessions created before roles existed carry no `role`. Backfill it once so
@@ -449,12 +491,14 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
 
 // The member list doubles as the admin bulk-add page, so both the plain GET and
 // the post-submit render go through here.
-async function renderMembers(res, { results = null, input = '' } = {}) {
+async function renderMembers(res) {
+  const members = await db.getUsers();
   res.render('members', {
     title: '会员列表',
-    members: await db.getUsers(),
-    results,
-    input
+    // The edit modal opens on the member's avatar, so every row carries the
+    // gravatar to fall back to. It can only be built here — it is an md5 of the
+    // address — and it is asked for 192px because the modal draws it at 96.
+    members: members.map(m => ({ ...m, avatarFallback: gravatar(m.email, 192) }))
   });
 }
 
@@ -481,9 +525,10 @@ app.get('/profile', requireLogin, wrap(async (req, res) => {
     },
     // The member's own photo when they have set one, gravatar otherwise. The
     // fallback goes along too: the page swaps back to it without a reload when
-    // the photo is cleared in the modal, or when the URL fails to load.
-    avatar: row.profile_photo || gravatar(row.email, 144),
-    avatarFallback: gravatar(row.email, 144)
+    // the photo is cleared in the modal, or when the URL fails to load. 192px
+    // covers both boxes it lands in — 72 on the card, 96 in the edit modal.
+    avatar: row.profile_photo || gravatar(row.email, 192),
+    avatarFallback: gravatar(row.email, 192)
   });
 }));
 
@@ -513,7 +558,10 @@ function parseUserLines(text) {
 app.get('/add-user', (req, res) => res.redirect('/members'));
 app.get('/member-list', (req, res) => res.redirect('/members'));
 
-app.post('/members/add-users', requireAdmin, wrap(async (req, res) => {
+// Answers JSON to the modal's fetch rather than re-rendering /members: rendering
+// the result of the POST left the browser sitting on /members/add-users, so a
+// refresh re-submitted the whole paste. Same reason it carries the API guard.
+app.post('/members/add-users', requireAdminApi, wrap(async (req, res) => {
   const parsed = parseUserLines(req.body.users);
   const results = [];
   for (const item of parsed) {
@@ -534,8 +582,7 @@ app.post('/members/add-users', requireAdmin, wrap(async (req, res) => {
       results.push({ line: item.line, ok: false, message: err.message });
     }
   }
-  // Keep the pasted text only when something failed, so it can be corrected.
-  await renderMembers(res, { results, input: results.some(r => !r.ok) ? req.body.users : '' });
+  res.json({ ok: results.length > 0 && results.every(r => r.ok), results });
 }));
 
 // Same capability as the bulk-add form, so it carries the same gate — leaving it
@@ -603,6 +650,67 @@ app.put('/api/users/:email', requireSelfOrAdminApi, wrap(async (req, res) => {
   if (req.session.user.email === user.email) req.session.user.name = user.name;
   res.json({ ok: true, user });
 }));
+
+// An uploaded avatar is bytes in `gsffc.user_photos`; `users.profile_photo`
+// keeps its documented shape and holds the URL below. The upload is limited to
+// what a picture can be, and the *magic bytes* decide the type rather than the
+// Content-Type header — the value is handed straight back to a browser as an
+// image, so nothing may be stored that isn't one. The modal downscales to a
+// 512px square JPEG before sending, so the limit here is headroom, not a target.
+const PHOTO_MAX_BYTES = 3 * 1024 * 1024;
+const PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+
+function sniffImage(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.toString('hex', 0, 8) === '89504e470d0a1a0a') return 'image/png';
+  if (buf.toString('latin1', 0, 3) === 'GIF') return 'image/gif';
+  if (buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') {
+    return 'image/webp';
+  }
+  return null;
+}
+
+// Serve a stored avatar. Gated like every other member-facing route, but with a
+// bare 401 rather than `requireLogin`: this is an <img> src, and a redirect to
+// /login would both render as a broken image and leave the picture's URL in
+// `returnTo` as where to go after signing in. The stored URL carries the upload
+// time as ?v=, so each upload is a distinct URL and this response can be cached
+// for good — a replaced picture is simply never requested again.
+app.get('/photos/:email', wrap(async (req, res) => {
+  if (!req.session.user) return res.sendStatus(401);
+  const photo = await db.getUserPhoto(req.params.email);
+  if (!photo) return res.sendStatus(404);
+  res.set('Content-Type', photo.mime);
+  res.set('Cache-Control', 'private, max-age=31536000, immutable');
+  res.send(photo.bytes);
+}));
+
+// Backs the pencil on the avatar in the edit-user modal: the picked file is
+// resized in the browser and POSTed here as raw image bytes (no multipart, no
+// upload library). Same gate as the PUT above — your own row is self-service,
+// anyone else's is an admin power — and the same rule for an admin's row.
+app.post('/api/users/:email/photo',
+  requireSelfOrAdminApi,
+  express.raw({ type: PHOTO_TYPES, limit: PHOTO_MAX_BYTES }),
+  wrap(async (req, res) => {
+    const email = String(req.params.email || '').trim().toLowerCase();
+    // An admin's identity is theirs alone, exactly as for the password and the
+    // name: the role is re-read here, never taken from the session copy.
+    if (email !== req.session.user.email) {
+      const target = await db.getUserByEmail(email);
+      if (!target) return res.status(404).json({ ok: false, message: '用户不存在' });
+      if (target.role === db.ADMIN) {
+        return res.status(403).json({ ok: false, message: '管理员的头像只能由本人修改' });
+      }
+    }
+    // express.raw leaves an empty object when the Content-Type didn't match.
+    const mime = sniffImage(req.body);
+    if (!mime) return res.status(415).json({ ok: false, message: '只能上传图片文件' });
+    const user = await db.setUserPhoto(email, { mime, bytes: req.body });
+    if (!user) return res.status(404).json({ ok: false, message: '用户不存在' });
+    res.json({ ok: true, user });
+  }));
 
 // Backs the "删除用户" button in the edit modal. Admin-only — unlike the PUT
 // above there is no self-service branch: deleting your own account would destroy
@@ -730,7 +838,26 @@ app.use((req, res) => res.status(404).render('404', { title: 'Not Found' }));
 
 app.use((err, req, res, next) => {
   console.error(err);
-  res.status(500).render('404', { title: 'Server Error' });
+  // A body rejected by express.raw/json never reaches its route, so the size
+  // limit would otherwise surface as a bare "服务器错误" — which tells an admin
+  // whose photo was refused nothing about why.
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ ok: false, message: '文件太大，请换一张更小的图片' });
+  }
+  res.status(500);
+  // An /api/* caller wants JSON, not a page it can't parse.
+  if (req.path.startsWith('/api/')) {
+    return res.json({ ok: false, message: '服务器错误' });
+  }
+  // The error page is itself a template render and can fail in turn — on a
+  // database outage the session middleware throws before the locals are set.
+  // Falling back to text is what keeps the original error visible instead of
+  // being replaced by "path is not defined" from header.ejs.
+  res.render('404', { title: 'Server Error' }, (renderErr, html) => {
+    if (!renderErr) return res.send(html);
+    console.error(renderErr);
+    res.type('text').send('Server Error');
+  });
 });
 
 // Only start a long-running server when executed directly (local dev / a

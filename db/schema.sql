@@ -1,8 +1,10 @@
 -- GSF demo: schema + seed data (PostgreSQL).
 -- All objects live in the hardcoded `gsffc` schema.
 -- Nothing in the app runs this file — apply it by hand before the first run.
--- ON CONFLICT DO NOTHING keeps it safe to re-apply to a fresh database; an
--- database that predates the signup/check-in tables needs db/migrations/ instead.
+-- This is the only DDL there is; there are no migration files. CREATE … IF NOT
+-- EXISTS and ON CONFLICT DO NOTHING keep it safe to re-apply, so an existing
+-- database is moved forward by running it again — anything that is not a fresh
+-- create (a new column, a changed CHECK) is applied by hand in psql alongside it.
 
 CREATE SCHEMA IF NOT EXISTS gsffc;
 
@@ -15,8 +17,27 @@ CREATE TABLE IF NOT EXISTS gsffc.users (
   role          TEXT NOT NULL DEFAULT 'MEMBER' CHECK (role IN ('MEMBER', 'ADMIN')),
   -- URL of the member's photo, e.g.
   -- https://raw.githubusercontent.com/gsffc/gsffc.github.io/refs/heads/main/assets/img/teams/GSF/donglin.jpg
+  -- A photo uploaded from the edit-user modal lives in gsffc.user_photos and
+  -- this column holds its own URL, '/photos/<email>?v=<upload time>'.
   -- NULL falls back to the gravatar built from the email.
   profile_photo TEXT
+);
+
+-- Avatars uploaded from the edit-user modal. The bytes are kept out of `users`
+-- on purpose: every page that lists members SELECTs that table (the event page
+-- reads all of them to build the roster), and a base64 picture per row would be
+-- megabytes of query result nobody looks at. `users.profile_photo` keeps its
+-- documented shape — a URL — and server.js serves this row from it.
+--
+-- `updated_at` is the cache key: the stored URL carries it as ?v=, so a new
+-- upload is a new URL and no browser can go on showing the old picture.
+-- Unlike the roster tables this one *does* carry a foreign key: a photo can
+-- only ever belong to an account, so deleting the member takes it along.
+CREATE TABLE IF NOT EXISTS gsffc.user_photos (
+  email      TEXT PRIMARY KEY REFERENCES gsffc.users(email) ON DELETE CASCADE,
+  mime       TEXT NOT NULL,
+  bytes      BYTEA NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- `start_at` and `end_at` replace the old `date` + free-text `time` pair.
@@ -58,9 +79,8 @@ CREATE TABLE IF NOT EXISTS gsffc.events (
 -- by a member being deleted (`deleteUser`). `promoted_at` records when that
 -- happened and stays NULL for a signup that was confirmed from the start.
 --
--- `email` deliberately carries no foreign key to `users`: the seeds below (and
--- the rosters of a database migrated from the old JSON columns) name members
--- that may not have accounts yet. db.js `deleteUser` does the cascade by hand.
+-- `email` deliberately carries no foreign key to `users`: the seeds below name
+-- members that may not have accounts yet. db.js `deleteUser` cascades by hand.
 CREATE TABLE IF NOT EXISTS gsffc.event_signups (
   event_id     TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,
   email        TEXT NOT NULL,
@@ -71,8 +91,7 @@ CREATE TABLE IF NOT EXISTS gsffc.event_signups (
 );
 
 -- One row per check-in. `checked_in_at` is the arrival time; the coordinates and
--- the distance the server computed are kept as the evidence behind it (NULL for
--- rows migrated from the old JSON column, where only the fact was recorded).
+-- the distance the server computed are kept as the evidence behind it.
 -- A member may only check in while SIGNED_UP, and withdrawing deletes the row.
 CREATE TABLE IF NOT EXISTS gsffc.event_checkins (
   event_id      TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,

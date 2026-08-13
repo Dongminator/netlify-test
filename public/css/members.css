@@ -196,10 +196,124 @@
   color: var(--gsf-ink-faint);
 }
 
+/* --- avatar upload (the edit-user modal) --------------------------------
+   The picture and its pencil are one positioned block, centred at the top of
+   the modal body. It is sized in px, not rem: the box has to match the
+   `width`/`height` on the <img> (which is what keeps the layout still while
+   the picture loads) and the gravatar asked for in server.js — 192, i.e. 2×. */
+
+.avatar-edit {
+  position: relative;
+  width: 96px;
+  height: 96px;
+  margin: 0 auto 1.25rem;
+}
+
+.avatar-edit-view {
+  display: block;
+  border-radius: 50%;
+}
+
+.avatar-edit-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: var(--gsf-50);
+  /* An uploaded photo is cropped square before it is sent, but a member may
+     still carry a URL set by hand at any aspect ratio. */
+  object-fit: cover;
+}
+
+/* The pencil sits on the rim, outside the circle's flow, so the picture keeps
+   its full width. The white ring is what separates it from a dark photo. */
+.avatar-edit-btn {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: var(--gsf-600);
+  color: #fff;
+  font-size: .8125rem;
+  line-height: 1;
+  box-shadow: 0 1px 4px rgba(16, 42, 67, .3);
+  cursor: pointer;
+  transition: background .2s ease;
+}
+
+.avatar-edit-btn:hover {
+  background: var(--gsf-700);
+}
+
+.avatar-edit-btn:focus {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(77, 165, 244, .45);
+}
+
+.avatar-edit-btn:disabled {
+  opacity: 1; /* uploading is not "unavailable" — the spinner says what it is */
+}
+
+/* One icon per state, all three in the markup; the class on the button picks
+   which one shows, so nothing swaps icon classes while the upload runs. */
+.avatar-edit-btn .avatar-icon-busy,
+.avatar-edit-btn .avatar-icon-done,
+.avatar-edit-btn.is-uploading .avatar-icon-idle,
+.avatar-edit-btn.is-done .avatar-icon-idle {
+  display: none;
+}
+
+.avatar-edit-btn.is-uploading .avatar-icon-busy,
+.avatar-edit-btn.is-done .avatar-icon-done {
+  display: inline-block;
+}
+
+/* Saved. The green stays until the modal is opened again — a member who looked
+   away while it uploaded still finds the confirmation waiting. */
+.avatar-edit-btn.is-done {
+  background: #2e9e5b;
+  animation: avatar-saved .45s ease;
+}
+
+.avatar-edit-btn.is-done:hover {
+  background: #27824c;
+}
+
+@keyframes avatar-saved {
+  0%   { transform: scale(.4); }
+  60%  { transform: scale(1.25); }
+  100% { transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .avatar-edit-btn.is-done {
+    animation: none;
+  }
+}
+
 @media (max-width: 575.98px) {
   .member-table thead th,
   .member-table td {
     padding: .625rem .5rem;
+  }
+
+  /* Room is the scarce thing in a phone modal, so the picture gives some back —
+     the pencil does not, it is the tap target. */
+  .avatar-edit {
+    width: 80px;
+    height: 80px;
+    margin-bottom: 1rem;
+  }
+
+  .avatar-edit-btn {
+    width: 36px;
+    height: 36px;
   }
 
   /* Tighten the whole card: smaller avatar, less padding, a narrower label

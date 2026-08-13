@@ -112,6 +112,64 @@ function normalizePhoto(value) {
   return url;
 }
 
+// Where an uploaded avatar is served from. `v` is the moment it was stored, so
+// every upload is a *new* URL: nothing — browser, CDN, or the member's own
+// phone — can go on showing the picture it replaced. The value passes
+// `normalizePhoto` unchanged, since it is a site-relative path like any other.
+const photoUrl = (email, version) => `/photos/${encodeURIComponent(email)}?v=${version}`;
+
+// Store the member's uploaded picture and point their `profile_photo` at it.
+// The bytes go in `user_photos`, never in `users`: that table is read whole by
+// every page listing members, and a picture per row would ride along with it.
+// The two writes are one transaction — a photo row nothing points at would
+// never be served, and a URL with no row behind it renders as a broken image.
+// Returns the updated user row, or null when there is no such member.
+async function setUserPhoto(email, { mime, bytes }) {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!normalized) throw new Error('email 不能为空');
+  if (!mime || !bytes || !bytes.length) throw new Error('图片内容为空');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Users first: the FK on `user_photos` would reject an unknown member with a
+    // constraint error, and "no such member" is a 404, not a 500.
+    const { rows } = await client.query(
+      `UPDATE ${SCHEMA}.users SET profile_photo = $2 WHERE email = $1
+       RETURNING email, name, position, joined, role, profile_photo`,
+      [normalized, photoUrl(normalized, Date.now())]
+    );
+    if (!rows[0]) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+    await client.query(
+      `INSERT INTO ${SCHEMA}.user_photos (email, mime, bytes, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (email) DO UPDATE SET
+         mime = EXCLUDED.mime, bytes = EXCLUDED.bytes, updated_at = now()`,
+      [normalized, mime, bytes]
+    );
+    await client.query('COMMIT');
+    return rowToUser(rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// The stored picture itself, for GET /photos/:email. Null when the member never
+// uploaded one — their `profile_photo` is then either empty or somebody else's
+// URL, and the page falls back to the gravatar.
+async function getUserPhoto(email) {
+  const { rows } = await pool.query(
+    `SELECT mime, bytes, updated_at FROM ${SCHEMA}.user_photos WHERE email = $1`,
+    [String(email || '').trim().toLowerCase()]
+  );
+  return rows[0] || null;
+}
+
 async function getUserByEmail(email) {
   const { rows } = await pool.query(
     `SELECT * FROM ${SCHEMA}.users WHERE email = $1`, [email]
@@ -206,8 +264,10 @@ async function updateUser({ email, password, name, position, profilePhoto }) {
   return rowToUser(rows[0]);
 }
 
-// Remove a member for good. There are no foreign keys pointing at `users`, so
-// nothing cascades on its own: the member's signups and check-ins would survive
+// Remove a member for good. The only foreign key pointing at `users` is
+// `user_photos` (their uploaded avatar, which goes with the row); the roster
+// tables carry none, so nothing else cascades on its own: the member's signups
+// and check-ins would survive
 // (rendering as a raw address on the event page and still counting against
 // capacity), and their `express-session` rows would keep an already-signed-in
 // browser working. Both are cleaned up here, the event rows in the same
@@ -526,6 +586,7 @@ async function deleteEvent(id) {
 module.exports = {
   pool, ROLES, MEMBER, ADMIN, SIGNED_UP, WAITLIST,
   getUsers, getUserByEmail, verifyPassword, createUser, upsertUser, updateUser, deleteUser,
+  setUserPhoto, getUserPhoto,
   getEvents, getEvent, createEvent, updateEvent, deleteEvent,
   signUpForEvent, withdrawFromEvent, clearEventRoster, checkInToEvent
 };

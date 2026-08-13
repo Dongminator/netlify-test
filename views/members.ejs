@@ -54,7 +54,8 @@
                         data-name="<%= m.name %>"
                         data-position="<%= m.position %>"
                         data-role="<%= m.role %>"
-                        data-photo="<%= m.profilePhoto || '' %>">
+                        data-photo="<%= m.profilePhoto || '' %>"
+                        data-fallback="<%= m.avatarFallback %>">
                   <i class="fas fa-pen" aria-hidden="true"></i>
                 </button>
               </td>
@@ -71,7 +72,7 @@
        aria-labelledby="bulk-add-title" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
       <div class="modal-content">
-        <form method="POST" action="/members/add-users">
+        <form method="POST" action="/members/add-users" id="bulk-add-form">
           <div class="modal-header">
             <h5 class="modal-title" id="bulk-add-title">批量添加会员</h5>
             <button type="button" class="close" data-dismiss="modal" aria-label="关闭">
@@ -80,30 +81,15 @@
           </div>
 
           <div class="modal-body">
-            <% if (results) { %>
-              <div class="card mb-3">
-                <div class="card-header">
-                  处理结果：成功 <%= results.filter(r => r.ok).length %> / <%= results.length %>
-                </div>
-                <ul class="list-group list-group-flush">
-                  <% if (results.length === 0) { %>
-                    <li class="list-group-item text-muted">没有可处理的内容</li>
-                  <% } %>
-                  <% results.forEach(r => { %>
-                    <li class="list-group-item <%= r.ok ? '' : 'list-group-item-danger' %>">
-                      <div class="text-monospace small"><%= r.ok ? r.email : r.line %></div>
-                      <span class="badge badge-<%= r.ok ? 'success' : 'danger' %>"><%= r.message %></span>
-                    </li>
-                  <% }) %>
-                </ul>
-              </div>
-            <% } %>
+            <%# Filled in by the submit handler; the form posts with fetch, so the
+                results arrive without leaving /members. %>
+            <div id="bulk-add-results"></div>
 
             <div class="form-group mb-0">
               <label for="users">每行一个账号，格式 <code>username:password</code></label>
               <textarea class="form-control text-monospace" id="users" name="users" rows="8"
                         placeholder="donglin@gsffc.org:donglin&#10;dike@gsffc.org:gsf2026"
-                        required><%= input %></textarea>
+                        required></textarea>
               <small class="form-text text-muted">
                 <strong>存在的用户可在此页改密码</strong>：账号已存在时只更新密码，不会改动姓名和场上位置。
                 按第一个冒号拆分，密码本身可以包含冒号。空行和以 <code>#</code> 开头的行会被忽略。
@@ -113,7 +99,7 @@
 
           <div class="modal-footer">
             <button class="btn btn-secondary" type="button" data-dismiss="modal">取消</button>
-            <button class="btn btn-brand" type="submit">保存</button>
+            <button class="btn btn-brand" type="submit" id="bulk-add-submit">保存</button>
           </div>
         </form>
       </div>
@@ -161,14 +147,110 @@
     });
   </script>
 
-  <% if (results) { %>
-    <script>
-      // Submitting re-renders the whole page, so reopen the modal to show the
-      // results. Waits for DOMContentLoaded: bootstrap's JS loads in the footer.
-      document.addEventListener('DOMContentLoaded', function () {
-        $('#bulk-add-modal').modal('show');
+  <script>
+    // The bulk-add form posts with fetch and renders its own results, so the
+    // browser never leaves /members: a plain POST left the URL at
+    // /members/add-users and a refresh there re-submitted the whole paste.
+    (function () {
+      var RELOAD_SECS = 5;
+      var form = document.getElementById('bulk-add-form');
+      var submit = document.getElementById('bulk-add-submit');
+      var box = document.getElementById('bulk-add-results');
+      var textarea = document.getElementById('users');
+      var timer = null;
+
+      function el(tag, className, text) {
+        var node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text != null) node.textContent = text;
+        return node;
+      }
+
+      // One line per pasted account: the address (or the line that couldn't be
+      // parsed) and what happened to it.
+      function renderList(results) {
+        var list = el('ul', 'list-group list-group-flush');
+        results.forEach(function (r) {
+          var item = el('li', 'list-group-item' + (r.ok ? '' : ' list-group-item-danger'));
+          item.appendChild(el('div', 'text-monospace small', r.ok ? r.email : r.line));
+          item.appendChild(el('span', 'badge badge-' + (r.ok ? 'success' : 'danger'), r.message));
+          list.appendChild(item);
+        });
+        return list;
+      }
+
+      function render(results) {
+        var added = results.filter(function (r) { return r.ok; });
+        box.textContent = '';
+
+        var card = el('div', 'card mb-3');
+        card.appendChild(el('div', 'card-header', '处理结果：成功 ' + added.length + ' / ' + results.length));
+        if (results.length === 0) {
+          var empty = el('ul', 'list-group list-group-flush');
+          empty.appendChild(el('li', 'list-group-item text-muted', '没有可处理的内容'));
+          card.appendChild(empty);
+        } else {
+          card.appendChild(renderList(results));
+        }
+        box.appendChild(card);
+        return added;
+      }
+
+      // Everything landed: say so, then bring the page back with the new rows on
+      // it. A fresh GET of /members, so the URL and the history stay clean.
+      function countdown(added) {
+        var note = el('div', 'alert alert-success');
+        box.insertBefore(note, box.firstChild);
+        var left = RELOAD_SECS;
+        var names = added.map(function (r) { return r.email; }).join('、');
+        function tick() {
+          note.textContent = '已添加 ' + names + '，' + left + ' 秒后返回会员列表…';
+          if (left-- <= 0) {
+            clearInterval(timer);
+            window.location.assign('/members');
+            return;
+          }
+        }
+        tick();
+        timer = setInterval(tick, 1000);
+      }
+
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        if (timer) return; // already on the way back
+        submit.disabled = true;
+        fetch(form.action, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ users: textarea.value })
+        }).then(function (res) {
+          return res.json().catch(function () { return { ok: false, message: '服务器返回异常' }; });
+        }).then(function (data) {
+          if (!data.results) throw new Error(data.message || '保存失败');
+          var added = render(data.results);
+          // Nothing succeeded: keep the paste so it can be corrected in place.
+          if (added.length === 0) {
+            submit.disabled = false;
+            return;
+          }
+          textarea.value = '';
+          countdown(added);
+        }).catch(function (err) {
+          box.textContent = '';
+          box.appendChild(el('div', 'alert alert-danger', err.message || '保存失败'));
+          submit.disabled = false;
+        });
       });
-    </script>
-  <% } %>
+
+      // A cancelled or re-opened dialog starts clean. Waits for window.load:
+      // jQuery and bootstrap only load in the footer.
+      window.addEventListener('load', function () {
+        $('#bulk-add-modal').on('hidden.bs.modal', function () {
+          if (timer) return; // mid-countdown; the page is about to reload anyway
+          box.textContent = '';
+        });
+      });
+    }());
+  </script>
 <% } %>
 <%- include('partials/footer') %>

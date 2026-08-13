@@ -24,16 +24,15 @@ There is no test suite, linter, or build step. `public/` is served as-is.
 runs it, `db.js` only opens a pool and queries. Consequences to remember:
 
 - Adding a column means editing `db/schema.sql` *and* applying it manually to every existing database.
-- `db/schema.sql` is the shape of a **fresh** database. A database that already has data is moved
-  forward by the files in [db/migrations/](db/migrations/), applied by hand and in order
-  (`psql "$DATABASE_URL" -f db/migrations/001-…sql`); nothing tracks which have run, so each one is
-  written to be safe to re-apply. Both files must be changed together — schema.sql for new installs,
-  a migration for existing ones.
+- `db/schema.sql` is the **only** DDL there is — there are no migration files. It is written to be safe
+  to re-apply (`CREATE … IF NOT EXISTS`, `ON CONFLICT DO NOTHING`), so an existing database is moved
+  forward by running it again, and anything it cannot express as a create (a new column on a table that
+  already exists, a changed CHECK) is applied by hand in `psql` at the same time.
 - `db/schema.sql` seeds only the three events; it seeds **no users**. Members are created from the
   "批量添加会员" modal on `/members` (paste `username:password` lines); its button and the modal
   itself only render for admins.
   Both `POST /members/add-users` and `POST /api/users` require an
-  ADMIN session, so the very first account still has to be INSERTed by hand with a bcrypt hash — and
+  ADMIN session (both answer JSON — see 批量添加会员 below), so the very first account still has to be INSERTed by hand with a bcrypt hash — and
   then promoted with `UPDATE gsffc.users SET role = 'ADMIN' WHERE email = …`, or nobody can add anyone.
 - Everything lives in the hardcoded `gsffc` schema (`SCHEMA` in [db.js](db.js#L6)); every query is
   prefixed with it. The `express-session` table is created automatically by `connect-pg-simple`
@@ -81,8 +80,8 @@ end-after-start, in SQL and in JS and in the browser) is a plain string comparis
 
 **The roster is two tables, `gsffc.event_signups` and `gsffc.event_checkins`** — one row per member per
 event, each carrying its own timestamp (`signed_up_at`, `checked_in_at`). They replaced a pair of JSON
-string columns on `events` that held bare arrays of emails and recorded no times at all; migration 001
-backfills them and drops the columns. Consequences:
+string columns on `events` that held bare arrays of emails and recorded no times at all; those columns
+are gone from `db/schema.sql` and nothing reads them any more. Consequences:
 
 - `rowToEvent` takes the event's signup rows as a second argument and hangs **`event.roster`** off the
   event — the ordered list of `{email, status, signedUpAt, promotedAt, checkedInAt, checkinDistance}`,
@@ -98,8 +97,8 @@ backfills them and drops the columns. Consequences:
   is what makes "is there room?" and "take the place" atomic: the old read-modify-write could lose a
   concurrent signup, and two members racing for the last place could both get it. Add roster writes as
   new functions in that shape; never mutate an array and re-save the event.
-- `email` carries **no foreign key to `users`** (the seeds, and rosters migrated from the old columns,
-  name members who may have no account), so `deleteUser` still cascades by hand — see below.
+- `email` carries **no foreign key to `users`** (the seeds name members who may have no account), so
+  `deleteUser` still cascades by hand — see below.
 
 **Waitlist.** `event_signups.status` is `SIGNED_UP` or `WAITLIST`, constrained by a CHECK and mirrored by
 `db.SIGNED_UP`/`db.WAITLIST`. Signing up for a full event is never refused: `signUpForEvent` counts the
@@ -361,6 +360,18 @@ and user) use it, so it is deliberately *not* scoped to an id. A `.form-text` hi
 is hidden there — it would otherwise land in the middle of that flex row — so the placeholder has to
 carry the same information. `.page-head` also shrinks under `sm`, on every page that uses it.
 
+**批量添加会员 posts with `fetch` and never navigates.** `POST /members/add-users` splits the paste on
+each line's *first* colon and runs `db.upsertUser` per line — a new address is created with that
+password, an existing one keeps its name/position/role and only has its password reset — which is why
+it is both the "add members" and the "reset a password" path, and the only way an account is created at
+all. It answers `{ok, results}` (one entry per line: the address or the unparsable line, and what
+happened to it) under `requireAdminApi`. It used to render `/members` straight out of the POST, which
+left the browser on `/members/add-users` and made a refresh re-submit the whole paste; the results are
+now drawn into the open modal by its own script. All succeeded → the textarea is cleared and a 5-second
+countdown ends in `location.assign('/members')`, one fresh GET, so the new rows appear with the URL and
+the history untouched. Anything failed → the paste is left in place to be corrected and nothing
+redirects. `renderMembers` therefore takes no `results`/`input` locals any more.
+
 `db.updateUser` is the edit-only counterpart, behind `PUT /api/users/:email` and the per-row
 pencil modal on `/members`. It never inserts and needs no password, so a blank password box means
 "keep the current one"; `name`/`position`/`profilePhoto` are written only when the key is present, and an
@@ -377,13 +388,46 @@ falls back to `gravatar(email)` — so a member without one looks exactly as bef
 member typed and can 404, so `/profile` also carries the gravatar in `data-fallback` and swaps to it from
 `onerror`; `.profile-avatar` is `object-fit: cover`, since the picture won't be square.
 
-**Nothing in the UI sets that URL.** The edit form used to carry a 头像链接 box and it was deliberately
-removed: the modal now omits `profilePhoto` from the PUT body entirely, and because `db.updateUser` only
-writes keys that are present, an edit leaves the column untouched. `PUT /api/users/:email` still accepts
-the key (`server.js` passes it through when sent) and `db.updateUser` still writes it, so the column is
-set by hand in SQL, or by re-adding an input. The pages keep rendering the value and their `data-photo`
-attributes; the saved row that comes back from the PUT still carries the unchanged photo, so the
-`user-updated` handlers that patch the avatar keep working.
+**The URL is not typed — it is uploaded.** The edit form's old 头像链接 box is still gone and the modal
+still omits `profilePhoto` from the PUT body entirely (`db.updateUser` only writes keys that are present,
+so saving the form can never undo an upload). What sets the column is the avatar at the top of
+[user-edit-modal.ejs](views/partials/user-edit-modal.ejs) — see 头像上传 below. `PUT /api/users/:email`
+still accepts the key and `db.updateUser` still writes it, so an external URL can also be set by hand in
+SQL. The pages keep rendering the value and their `data-photo` attributes; every path that changes the
+photo dispatches the same `user-updated` event, so the handlers patching the avatar keep working.
+
+**头像上传.** The modal opens on the member's picture with a pencil on its rim: tapping the picture opens
+it full size (`target="_blank"`), tapping the pencil opens the file picker and **the upload starts as
+soon as a file is chosen** — no confirm step, no save button. The pencil is the progress indicator: three
+icons live in the markup at once (pencil / spinner / tick) and `is-uploading`/`is-done` on the button
+decide which one shows, so nothing swaps icon classes mid-flight. The green tick **stays** until the
+modal is opened again. Its states are set in one place, `setPhotoState`.
+
+- **The picture never leaves the browser at full size.** `squareJpeg` draws the chosen file into a
+  canvas — centre-cropped square, at most 512px, JPEG at 0.85 — so a 4MB phone photo arrives as ~30KB,
+  and the crop matches the `object-fit: cover` every avatar box uses. The resized blob is POSTed as the
+  raw request body (`Content-Type: image/jpeg`); there is no multipart parser and no upload library.
+- **`POST /api/users/:email/photo`** (`requireSelfOrAdminApi`, `express.raw`) decides the type from the
+  **magic bytes**, not the Content-Type header — the value is handed back to a browser as an image, so
+  only something that really is one may be stored. It carries the same rule as the PUT: an `ADMIN` row's
+  photo is writable only by that admin, re-read from the database. The modal mirrors it by hiding the
+  pencil (rendering only). It answers `{ok, user}`, the same shape the PUT does, and the script
+  dispatches `user-updated` with it — which is what patches the profile card, the navbar and the
+  including page's `data-photo` without a reload.
+- **The bytes live in `gsffc.user_photos`, not in `users`.** Every page that lists members SELECTs
+  `users` whole (the event page reads all of them to build the roster), so a base64 picture per row would
+  ride along with all of it; `profile_photo` keeps its documented shape and holds
+  `/photos/<email>?v=<upload time>` — which `normalizePhoto` accepts unchanged, being site-relative.
+  `db.setUserPhoto` writes both in one transaction. `GET /photos/:email` serves the row `immutable`:
+  the `?v=` changes on every upload, so a replaced picture is simply never requested again. It answers a
+  bare **401** rather than going through `requireLogin` — this is an `<img>` src, and a redirect to
+  `/login` would both render as a broken image and leave the picture's URL in `returnTo`.
+- This is the **one** table with a foreign key to `users` (`ON DELETE CASCADE`), so `db.deleteUser`'s
+  hand-rolled cascade needs no line for it.
+- **`serverless-http` must be given `binary: ['image/*']`** ([netlify/functions/server.js](netlify/functions/server.js)):
+  Lambda responses are strings and it base64-encodes only what it considers binary — by default nothing,
+  which would corrupt every avatar in production while working perfectly in dev. Any future route
+  answering with bytes needs its type in that list.
 
 **Deleting a member** is `db.deleteUser`, behind `DELETE /api/users/:email` (`requireAdminApi`, and the
 route additionally refuses the session's own email — deleting yourself would destroy the session doing
@@ -442,15 +486,15 @@ through, everything else is delegated to the admin guard (so the role is still r
 database). This is only safe because `db.updateUser` can't write `role` — a self-service write that
 could would be self-promotion. Gate any future user-write route the same way, or keep it admin-only.
 
-**An `ADMIN` row's password and name are writable only by that admin.** When the target email is not
-the session's, `PUT /api/users/:email` re-reads the row and, if its role is `ADMIN`, accepts nothing
+**An `ADMIN` row's password, name and photo are writable only by that admin.** When the target email is
+not the session's, `PUT /api/users/:email` re-reads the row and, if its role is `ADMIN`, accepts nothing
 but `position` — a non-empty `password`, a `name` different from the stored one, or any
 `profilePhoto` answers 403 (the form always resubmits the current name, so an unchanged one is not
 treated as an edit). This is the same shape as the delete rule: an admin is edited or removed by
 demoting them in SQL first. The modal mirrors it by `disabled`-ing 密码 and 姓名 and showing an info
 box on those rows, and leaves the locked keys out of the PUT body entirely — rendering only, as
-always. It reads the viewer's own address from `data-self-email` on **the modal element**, not from
-the 删除用户 button, which only renders for admins.
+always. It hides the avatar's pencil on the same test. It reads the viewer's own address from
+`data-self-email` on **the modal element**, not from the 删除用户 button, which only renders for admins.
 
 ## POC caveats deliberately left in
 
