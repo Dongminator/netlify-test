@@ -28,10 +28,11 @@ runs it, `db.js` only opens a pool and queries. Consequences to remember:
   to re-apply (`CREATE … IF NOT EXISTS`, `ON CONFLICT DO NOTHING`), so an existing database is moved
   forward by running it again. A new column on an existing table goes in **twice**: in the `CREATE TABLE`
   for a fresh database, and again as `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for one that already has
-  the table — see `events.visibility`, which does exactly that, with its CHECK added in a `DO $$ …
-  EXCEPTION WHEN duplicate_object $$` block since constraints have no `IF NOT EXISTS`. Both forms are
+  the table — see `events.total_headcount`, which does exactly that. Both forms are
   idempotent, so the file stays safe to run as a whole; anything that still can't be expressed that way
-  is applied by hand in `psql` at the same time.
+  (a CHECK, which has no `IF NOT EXISTS` and needs a `DO $$ … EXCEPTION WHEN duplicate_object $$` block)
+  is applied by hand in `psql` at the same time. **`events.visibility` predates this and is missing its
+  `ALTER`** — a database created before that column has to have it added by hand.
 - `db/schema.sql` seeds only the three events; it seeds **no users**. Members are created from the
   "批量添加会员" modal on `/members` (paste `username:password` lines); its button and the modal
   itself only render for admins.
@@ -145,6 +146,29 @@ restricted event shows an amber `.cal-event.is-restricted` chip with a lock on t
 `badge-warning` beside the title on its page; both come from `visibilityLabel()` in server.js, which is
 null for an ordinary event, so the lock only ever appears to someone allowed to see the event anyway.
 
+**总人数（包含试训、guest）is a recorded number, not a derived one.** `events.total_headcount` is what
+actually turned up — trialists and guests included — typed in by an admin, and it is deliberately
+disconnected from the roster: nothing in a signup, a withdrawal, a check-in or `promoteFromWaitlist`
+touches it, and `event.totalHeadcount` is a plain column value, not one of `rowToEvent`'s derived
+read-only fields. It answers a different question from `participants.length / capacity`, which is why the
+event page's `.roster-head` shows both, one `.roster-count` line each.
+
+It is the one **optional** number on an event: the column is nullable with no default, `null` means
+"not recorded", and that is what every event carries until somebody fills it in. Keeping `null` distinct
+from `0` ("nobody came") is what drives the shape of every step — `rowToEvent` passes it through instead
+of defaulting it the way `checkinRadius` is defaulted, `db.js` writes `event.totalHeadcount ?? null`
+(**not** `|| null`, which would turn a recorded 0 into NULL), `validateEvent` catches undefined/null/blank
+*before* coercing because `Number('')` is 0, and the modal's submit sends `null` for an empty box. The
+event page hides the line entirely when it is null, for an admin too — an unrecorded number says nothing
+worth a row in `.roster-head`, and the admin's entry point is 编辑活动, not that line.
+
+**It can therefore only be set *before* the event ends**, since the only way in is 编辑活动 and that
+button — with `PUT /api/events/:id` behind it — is frozen once `hasEnded(event)`. That is a deliberate
+choice, not an oversight: the freeze on a finished event was worth more than a post-match entry point.
+An admin who wants a number recorded afterwards types it in beforehand, corrects it before kick-off ends,
+or updates the column in SQL. Reopening this means either a 总人数-only route that skips the freeze, or
+lifting the freeze on editing.
+
 **Waitlist.** `event_signups.status` is `SIGNED_UP` or `WAITLIST`, constrained by a CHECK and mirrored by
 `db.SIGNED_UP`/`db.WAITLIST`. Signing up for a full event is never refused: `signUpForEvent` counts the
 confirmed rows under the lock and records a `WAITLIST` row instead, and the route redirects to
@@ -218,6 +242,11 @@ on click) would tear it down before the click landed. The results list is in nor
 dropdown: the modal body is a scroll container and would clip an overlay. It is a **sibling** of the
 `.field-inline-sm` wrapper around label+input, not a child — under `sm` that class makes its children one
 flex row and the list would join the line.
+
+**人数上限 and 总人数 share a row** (`col-sm-6` each), because they are read together and mean different
+things; 地点 took the whole width when they did, which also gives the geocoder's results list more room.
+总人数 has no `required` — blank is a valid answer — and its `.form-text` hint is repeated in the
+placeholder, since `.field-inline-sm` hides that hint under `sm`.
 
 **开始时间 and 结束时间 are two `datetime-local` inputs that need no conversion at all.** `start_at` and
 `end_at` are stored in exactly the form the control carries — `'YYYY-MM-DDTHH:MM'` — so the EJS preamble
@@ -293,6 +322,19 @@ renders — and confirmed with an inline `onsubmit` `confirm()`. `POST /event/:i
 `db.clearEventRoster`, which drops the waitlist and the check-ins along with the signups: a check-in
 from someone off the roster means nothing, and a queue with nobody ahead of it is noise.
 
+**A finished event is frozen: 编辑活动, 清空报名 and 删除活动 all disappear once `hasEnded(event)`**, the
+same instant that raises 已结束 and closes the check-in — a past event is the club's record of who signed
+up and who turned up, so nothing may still rewrite or destroy it. Each of the three routes enforces it
+itself, since the template only decides what renders: `PUT /api/events/:id` answers **400**, not the 404
+a hidden event answers (it exists and can still be read — and that 400 is also what stops a member
+raising `capacity` to promote themselves off a past event's waitlist), while the two HTML POSTs
+(`clear-signups`, `delete`) re-read the event and redirect back to it unchanged. **复制 deliberately
+stays** — copying a past event onto next week is how the next one is made, and it POSTs a *new* event
+rather than touching this one, which is why `event-modal.ejs` is still included on a finished event
+(nothing opens it in `edit` mode there) while `#delete-event-modal` is not rendered at all. The corollary:
+an event created with an already-past date can only be corrected in SQL. A new admin action that mutates
+an existing event needs the same `hasEnded` gate.
+
 **复制 has no route of its own.** It opens the same event modal in `copy` mode — every field prefilled
 from this event, the date a week on, editable before it is saved — so the copy is an ordinary
 `POST /api/events` (`requireAdminApi`) landing on the new event page. The copy starts with a fresh id and
@@ -325,13 +367,87 @@ row: the time, plus the coordinates and the distance it just computed, as the ev
 Checking in twice keeps the first row, so `checked_in_at` is always the moment of arrival. The route
 reads the member's own `event.roster` entry, so a **waitlisted** member is refused (there is no place to
 arrive at yet) as distinctly from one who never signed up. Withdrawing deletes the check-in with the
-signup. `event_checkins.checked_in_by` exists in the schema for an admin checking somebody else in;
-nothing writes it yet.
+signup.
+
+**代签到 is the same check-in with a different hand on the phone.** `POST /event/:id/checkin-for`
+(`requireAdminApi`, body `{email, lat, lng}`) is how an admin standing at the pitch checks in a member
+who can't do it themselves — a dead phone, no signal, no app. It is deliberately **not** a way around
+the geofence: `atTheField(event, body)` in [server.js](server.js#L248) holds the window gate, the
+coordinate parse and the radius test, and **both** check-in routes go through it, so the proxy path
+cannot quietly become the looser one. What it measures is the **admin's** position — they are the one
+who is actually there — and that is what lands in the row's `lat`/`lng`/`distance_m`. The rest of the
+gates are the member's: on the roster, `SIGNED_UP` (a waitlisted member is refused, as distinctly as one
+who never signed up), not already checked in.
+
+`event_checkins.checked_in_by` is what makes the row different, and it is now written: the admin's
+address, NULL for an ordinary self check-in — so a non-null value **is** the "this was a proxy" flag,
+which is why `db.checkInToEvent` drops a `by` equal to the member's own email rather than storing it.
+It carries no foreign key, for the same reason `event_checkins.email` doesn't. Fines are untouched:
+`lateness` reads `checked_in_at` alone, so a member checked in late by an admin owes exactly what they
+would have owed.
+
+In the UI it is a 代签到 button at the head of the admin action stack, rendered from `proxyTargets`
+(confirmed members with no check-in, empty unless `isAdmin && !isPast && event.coords`) — so it
+disappears once everybody has arrived, and the *dialog*, not the button, is where "签到尚未开放" is
+said. `#proxy-checkin-modal` carries **its own** `watchPosition`, alive only while it is open: the
+check-in button's script exists solely for a signed-up member who still has to arrive, and an admin
+doing this may have checked in already or not be playing at all. It has no map — the distance readout
+is what the admin needs. One `render()` writes the status line and the button's disabled state, exactly
+as on the check-in button, and a 1s ticker covers the window opening or closing while it sits there.
+A success **keeps the dialog open** minus the member just done (an admin at the pitch is usually doing
+several), and `hidden.bs.modal` reloads the page if anything changed rather than patching the stale
+roster behind it.
+
+On the roster the proxy check-in renders as a 代 in a blue circle followed by the admin's name, and it
+rides **under** the avatar at its left edge rather than in a corner of it: both corners are already
+spoken for (a proxy check-in is still a check-in, so it always carries the tick or the fine), and this
+mark has a name attached rather than being a glyph. `.roster-proxy` is an in-flow child of the 48px
+`.roster-avatar` — which is why that box now has an explicit `width` — so `max-width: 100%` is what caps
+the strip at the avatar's width; the circle holds its size (`flex: none`) and the name is the half that
+ellipsises, so no name can ever widen the grid column. Blue, because it says *how* the check-in
+happened, not whether it counts. The full name is in the `title` tooltip and in a `.sr-only` span, and
+`.roster-proxy-mark` is reused inline in the legend (hence `inline-flex`).
 
 **The check-in window opens an hour before kick-off** (`CHECKIN_LEAD_MS`) and closes when the event
 ends. `checkinOpensAt(event)` is that first instant and both the route and the page use it, so the
 button and the server agree on when it opens; `hasEnded(event)` closes it. A malformed `startAt` makes
 `checkinOpensAt` `NaN`, and both gates then fall back to distance alone.
+
+**迟到罚款 is derived, never stored.** Nothing about a fine is written to the database: `lateness(event,
+checkedInAt, ended)` in [server.js](server.js#L248) computes it on every render from `checked_in_at`
+against `clubEpoch(event.startAt)`, so correcting an event's start time re-prices its fines and no
+column can drift out of agreement with the times it was calculated from. It answers `{fine, lateMs}` —
+`fine` in whole dollars (0, `FINE_LATE` 5, `FINE_VERY_LATE` 10), `lateMs` null when there is no lateness
+to name — and `/event/:id` hangs `fine`/`lateLabel` off each participant. The thresholds:
+
+- **`FINE_GRACE_MS` (59s) is what makes the rule expressible at all.** `start_at` is a wall clock with no
+  seconds, but `checked_in_at` is a real timestamp that has them, so "on time" has to be a span rather
+  than an instant: anything inside the starting minute counts as punctual (for a 19:50 kick-off, up to
+  19:50:58). The club states it as "19:50:59 前签到都不算迟到".
+- Past that there is one boundary, **`FINE_TIER_MS` (5 minutes) after kick-off, and that instant is still
+  the cheaper side of it** (`late <= FINE_TIER_MS`): ≤5 min late is $5, beyond it $10.
+- **Absence costs the same as the far tier**, which is why both are `FINE_VERY_LATE` — but only once the
+  event is over. `lateness` takes `ended` (the route's `hasEnded`) for exactly that: before the end a
+  member who has not checked in has simply not arrived yet, and fining them would be a live accusation
+  that the next minute could withdraw.
+- A **waitlisted** member is outside the rules entirely — they were never due at the event — so
+  `toParticipant` only calls `lateness` for a `SIGNED_UP` row. An unparseable `startAt` fines nobody, the
+  same fallback the check-in gates take.
+
+In the UI a fine **replaces** the green check rather than joining it: the avatar's ring turns red and the
+tick badge's slot carries `.roster-fine`, the amount as dollar signs (one for $5, two for $10 — red signs
+on white, since a glyph knocked out of a solid red badge is much harder to *count* at 10px, and the count
+is the whole message). A member who merely hasn't checked in keeps the plain avatar; they are named in
+the 罚款统计 panel instead, which is where absence is stated. The `title` tooltip carries the amount and
+how late (`lateLabel`).
+
+**罚款统计 exists only on a finished event.** `/event/:id` passes `fines` as null until `hasEnded`, since
+nothing is settled while somebody can still turn up — one test for the template rather than a length
+check per tier. Both tiers always render, an empty one saying 无, so "nobody owes $10" is stated rather
+than implied. The panel sits in the `col-md-8` details column, not under the roster: on a phone that puts
+the tally of a finished event immediately after its details (details → 罚款 → 名单 → 按钮). A new tier
+means adding to the array `/event/:id` builds and to the note under the panel — the amounts are not
+otherwise hardcoded in the template.
 
 **One timezone, named once.** `start_at`/`end_at` are naive wall clocks and the process runs in **UTC**
 on Netlify, so turning one into an instant needs a zone: `CLUB_TIMEZONE` (env, default
@@ -363,10 +479,39 @@ never from two places at once. Its states are: after `CLOSES_AT`, disabled with 
 `setTimeout` armed at that instant closes the button on an event that ends while the page sits open,
 rather than leaving one the route answers 400 to); before the window, disabled with a live countdown;
 open but outside the radius (or with no fix yet), disabled with 到达球场后即可签到; open and inside,
-enabled with the `is-ready` pulse. The ticker stops the moment the window opens, position fixes drive it
-from there, and a `submitting` flag keeps it from re-enabling the button under an in-flight request.
-Times are compared against the server's clock, not the phone's: `SKEW` is the difference measured at
-render, so a phone running fast can't be shown a button the route will refuse.
+enabled with the `is-ready` pulse; and past kick-off, urgent (below). A `submitting` flag keeps it from
+re-enabling the button under an in-flight request. Times are compared against the server's clock, not
+the phone's: `SKEW` is the difference measured at render, so a phone running fast can't be shown a
+button the route will refuse.
+
+**The ticker runs two countdowns back to back, and `STARTS_AT` — not `OPENS_AT` — is where it ends.**
+Once the window opens the countdown doesn't stop, it switches to counting down to kick-off, appended to
+whatever the position gate is saying (`到达球场后即可签到 · 距活动开始 00:24:57`). `startTicker` is
+therefore bounded by `STARTS_AT`; past it the hint is a fixed sentence and position fixes drive the
+rest. `STARTS_AT` (`eventStartsAt`, `clubEpoch(event.startAt)`) **gates nothing** — check-in stays open
+past kick-off, which is the whole point of the fines — it only decides what the page *says*.
+
+**Past kick-off, an unchecked-in member gets the urgent button:** `setUrgent(true)` swaps `btn-success`
+for `btn-warning` and adds `is-urgent`, which repoints the pulse at `checkin-pulse-urgent` — amber, and
+**1.2s against the calm state's 1.8s, i.e. 50% faster**. Colour and pulse are one switch so they cannot
+disagree. The hint becomes 活动已开始，请赶快到场签到。不签到均按缺席处理。 — deliberately the same
+sentence whether or not the member is inside the circle, since the enabled amber button is what says
+they can act now. The server-rendered markup carries the urgent classes too when the event is already
+under way at load, or the page flashes a calm green button before the script's first `render()`.
+
+**The status badge beside the title changes three times on its own** — 签到已开放 (`badge-success`) when
+the window opens, 活动已开始 (`badge-warning`) at kick-off, 已结束 (`badge-secondary`) at the end, and
+nothing before any of that. It belongs to **everyone looking at the page** — a member who has already
+checked in, one who never signed up, an admin — so it has **its own script**, not a branch of the
+check-in one, which only exists for a signed-up member who still has to arrive. That script is one
+`setTimeout` aimed at the next transition rather than a ticking interval (a badge that changes three
+times in an event's life does not need a second-by-second loop), clamped to 2147483647 because
+`setTimeout` overflows past ~24.8 days and a distant event would otherwise fire immediately; it re-reads
+the clock on `visibilitychange`/`pageshow`/`focus` for the same backgrounding reason the button does. It
+is skipped entirely on a finished event and on one with an unparseable time, where the server's badge is
+the best answer there is. The element renders empty with `d-none` rather than being absent, because the
+script needs something to move on. A fourth state means adding to *both* the EJS `status` ternary and
+the script's `apply()`.
 
 **Everything on that page is built to survive the phone backgrounding it**, which is what a member
 actually does between arriving and checking in. Chrome on Android throttles a hidden tab's timers to
@@ -578,9 +723,10 @@ always. It hides the avatar's pencil on the same test. It reads the viewer's own
   of their own.
 - Creating an event is admin-only, and the "编辑" button only renders for admins, but the route behind it
   (`PUT /api/events/:id`) is still `requireLoginApi` — **any** logged-in member can edit any event they
-  can *see* by calling it directly, which now includes raising `capacity` to promote themselves off the
-  waitlist, and setting `visibility` (they cannot hide it from an admin, who sees everything, but they
-  can hide it from the rest of the club, or hand themselves an event meant for someone else).
+  can *see* by calling it directly, as long as it has not ended yet, which includes raising `capacity` to
+  promote themselves off the waitlist and setting `visibility` (they cannot hide it from an admin, who
+  sees everything, but they can hide it from the rest of the club, or hand themselves an event meant for
+  someone else).
   `POST /event/:id/delete` *is* `requireAdmin`, but it deletes the event and its whole roster
   irreversibly, with no soft-delete and no record of who did it — the same shape as deleting a member.
   There is no JSON delete endpoint under `/api/events/:id`.

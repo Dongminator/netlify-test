@@ -245,6 +245,75 @@ function hasEnded(event) {
 const CHECKIN_LEAD_MS = 60 * 60 * 1000;
 const checkinOpensAt = event => clubEpoch(event.startAt) - CHECKIN_LEAD_MS;
 
+// The half of a check-in that is about *being there*: the window has to be open,
+// and the posted position has to fall inside the event's radius. Both routes go
+// through it — a member checking themselves in, and an admin checking somebody
+// else in (代签到), where the position belongs to the admin, who is the one at
+// the pitch. Keeping it in one place is what stops the proxy path from quietly
+// becoming a looser one. Answers `{lat, lng, distance}` when the caller really
+// is at the field, or `{status, body}` — the refusal to send back — when not.
+function atTheField(event, body) {
+  // Too early. The button is disabled until this instant as well, so hitting
+  // this means either a hand-rolled request or a browser clock running fast.
+  const opensAt = checkinOpensAt(event);
+  if (Number.isFinite(opensAt) && Date.now() < opensAt) {
+    return {
+      status: 403,
+      body: { ok: false, opensAt, message: '签到尚未开放：活动开始前 1 小时才能签到' }
+    };
+  }
+  const lat = Number(body.lat);
+  const lng = Number(body.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return { status: 400, body: { ok: false, message: '未获取到有效位置' } };
+  }
+  const distance = Math.round(distanceMeters(lat, lng, event.coords.lat, event.coords.lng));
+  if (distance > event.checkinRadius) {
+    return {
+      status: 403,
+      body: {
+        ok: false,
+        distance,
+        message: `签到失败：你距离球场约 ${distance} 米，需在 ${event.checkinRadius} 米范围内`
+      }
+    };
+  }
+  return { lat, lng, distance };
+}
+
+// 迟到罚款. Kick-off is a wall clock with no seconds, but a check-in is a real
+// timestamp that has them — so "late" starts at kick-off + FINE_GRACE_MS, i.e.
+// a check-in anywhere inside the starting minute is still on time (the club's
+// rule: for a 19:50 kick-off, up to 19:50:58 is not late). Past that there is
+// one boundary, FINE_TIER_MS after kick-off, and that instant itself is still
+// the cheaper side of it. A member who never checked in owes the higher fine
+// too, which is why absence and the far tier share FINE_VERY_LATE.
+const FINE_GRACE_MS = 59 * 1000;
+const FINE_TIER_MS = 5 * 60 * 1000;
+const FINE_LATE = 5;
+const FINE_VERY_LATE = 10;
+
+// What one confirmed member owes for this event, and by how much they were
+// late. `ended` is the caller's `hasEnded`: absence only costs once the event
+// is over — before that a member who has not checked in has simply not arrived
+// yet — so a live event fines nobody for not being there. An unparseable
+// kick-off fines nobody at all, the same fallback every other gate takes.
+// `lateMs` is null whenever there is no lateness to name.
+function lateness(event, checkedInAt, ended) {
+  if (!checkedInAt) return { fine: ended ? FINE_VERY_LATE : 0, lateMs: null };
+  const late = new Date(checkedInAt).getTime() - clubEpoch(event.startAt);
+  if (!Number.isFinite(late) || late < FINE_GRACE_MS) return { fine: 0, lateMs: null };
+  return { fine: late <= FINE_TIER_MS ? FINE_LATE : FINE_VERY_LATE, lateMs: late };
+}
+
+// How late, for the roster tooltip. Seconds are shown under a minute only, so
+// a 12-minute arrival reads "迟到 12 分钟" rather than "12 分 3 秒".
+function lateLabel(ms) {
+  const total = Math.floor(ms / 1000);
+  const min = Math.floor(total / 60);
+  return min ? `迟到 ${min} 分钟` : `迟到 ${total} 秒`;
+}
+
 // Signup and check-in times are real timestamps (unlike `event.date`), so they
 // are formatted here rather than in the template: club-local time, minute
 // precision, in the app's one display shape — `m/dd/yy HH:MM`, the same one the
@@ -404,11 +473,19 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
   const mineRow = byEmail.get(req.session.user.email);
   const me = await viewer(req, mineRow ? mineRow.role : db.MEMBER);
   if (!db.canSeeEvent(event, me)) return res.status(404).render('404', { title: 'Not Found' });
+  // Needed before the roster is built, not just at render: whether the event is
+  // over is what turns "has not checked in yet" into "did not turn up".
+  const isPast = hasEnded(event);
   // `event.roster` is already ordered — confirmed members first, then the
   // waitlist, each half oldest signup first — so the index inside each half is
   // the member's place in it.
   const toParticipant = (signup, i) => {
     const u = byEmail.get(signup.email);
+    // Only a confirmed place can be late to it: a waitlisted member was never
+    // due at the event, so they are outside the fine rules entirely.
+    const { fine, lateMs } = signup.status === db.SIGNED_UP
+      ? lateness(event, signup.checkedInAt, isPast)
+      : { fine: 0, lateMs: null };
     return {
       email: signup.email,
       name: u ? u.name : signup.email,
@@ -419,6 +496,17 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
       checkedIn: !!signup.checkedInAt,
       signedUpAt: formatStamp(signup.signedUpAt),
       checkedInAt: formatStamp(signup.checkedInAt),
+      // 代签到: the admin who checked this member in for them, by name — null
+      // for the ordinary self check-in, which is what the roster's 代 badge
+      // tests. An admin who has since been deleted leaves their address behind,
+      // which is still a truer answer than dropping the fact of the proxy.
+      checkedInBy: signup.checkedInBy
+        ? ((byEmail.get(signup.checkedInBy) || {}).name || signup.checkedInBy)
+        : null,
+      // 0 when nothing is owed; 5 or 10 otherwise. `lateLabel` is empty for a
+      // member who never checked in — there is no arrival to be late by.
+      fine,
+      lateLabel: lateMs === null ? '' : lateLabel(lateMs),
       place: i + 1
     };
   };
@@ -444,14 +532,28 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     myCheckinAt: formatStamp(mine && mine.checkedInAt),
     // Set by the redirect from POST /event/:id/signup when the event was full.
     joinedWaitlist: req.query.joined === 'waitlist',
-    isPast: hasEnded(event),
-    // The check-in window, as two absolute instants, plus the clock the server
-    // measured them against: the page counts down against `Date.now()` corrected
-    // by the difference, so a phone whose clock is off doesn't offer a button
-    // the route will refuse (or hide one it would accept). The close is on the
-    // page too, so an event that ends while it sits open closes the button
-    // itself instead of leaving one the route answers 400 to.
+    isPast,
+    // The 罚款 panel, which exists only on a finished event: the fines are not
+    // final until nobody can still arrive. Null before that, so the template
+    // has one test rather than a length check per tier. Both tiers are always
+    // present, empty list and all, so the panel says who owes $5 *and* who owes
+    // $10 even when one of them is nobody.
+    fines: isPast
+      ? [FINE_LATE, FINE_VERY_LATE].map(amount => ({
+        amount,
+        names: participants.filter(p => p.fine === amount).map(p => p.name)
+      }))
+      : null,
+    // The event's three instants, plus the clock the server measured them
+    // against: the page counts down against `Date.now()` corrected by the
+    // difference, so a phone whose clock is off doesn't offer a button the route
+    // will refuse (or hide one it would accept). All three are on the page so an
+    // event that opens, starts or ends while it sits open moves the status badge
+    // and the button itself, rather than leaving a stale page behind. Kick-off
+    // is the one the route does *not* gate on — check-in stays open past it —
+    // but it is when the button turns urgent and the fines start.
     checkinOpensAt: checkinOpensAt(event),
+    eventStartsAt: clubEpoch(event.startAt),
     checkinClosesAt: clubEpoch(event.endAt),
     serverNow: Date.now(),
     // Non-null only for a restricted event — the badge beside the title.
@@ -494,7 +596,14 @@ app.post('/event/:id/withdraw', requireLogin, wrap(async (req, res) => {
 // Wipe an event's roster. Destructive and admin-only — the waitlist and the
 // check-ins go with the signups, since a check-in from someone no longer on the
 // list is meaningless and a waitlist with nobody ahead of it is noise.
+// A finished event's roster is the record of who actually turned up, so it is
+// frozen the minute the event ends — the same instant that raises 已结束 and
+// closes the check-in. The button is gone from the page by then; this catches a
+// hand-crafted POST, and lands back on the event so the admin sees it unchanged.
 app.post('/event/:id/clear-signups', requireAdmin, wrap(async (req, res) => {
+  const event = await db.getEvent(req.params.id);
+  if (!event) return res.status(404).render('404', { title: 'Not Found' });
+  if (hasEnded(event)) return res.redirect(`/event/${req.params.id}`);
   const result = await db.clearEventRoster(req.params.id);
   if (!result) return res.status(404).render('404', { title: 'Not Found' });
   res.redirect(`/event/${req.params.id}`);
@@ -504,7 +613,12 @@ app.post('/event/:id/clear-signups', requireAdmin, wrap(async (req, res) => {
 // it through the tables' ON DELETE CASCADE. The event page it was invoked from
 // is gone, so it lands on the calendar showing the month the event was in, with
 // ?deleted=1 raising the banner there.
+// Frozen once the event has ended, like clearing its roster: a past event is the
+// club's record of it, and deleting takes the signups and check-ins with it.
 app.post('/event/:id/delete', requireAdmin, wrap(async (req, res) => {
+  const event = await db.getEvent(req.params.id);
+  if (!event) return res.status(404).render('404', { title: 'Not Found' });
+  if (hasEnded(event)) return res.redirect(`/event/${req.params.id}`);
   const deleted = await db.deleteEvent(req.params.id);
   if (!deleted) return res.status(404).render('404', { title: 'Not Found' });
   res.redirect(`/calendar?month=${deleted.date.slice(0, 7)}&deleted=1`);
@@ -538,32 +652,45 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
   if (mine.checkedInAt) {
     return res.json({ ok: true, message: '你已签到过了' });
   }
-  // Too early. The button is disabled until this instant as well, so hitting
-  // this means either a hand-rolled request or a browser clock running fast.
-  const opensAt = checkinOpensAt(event);
-  if (Number.isFinite(opensAt) && Date.now() < opensAt) {
-    return res.status(403).json({
-      ok: false,
-      opensAt,
-      message: '签到尚未开放：活动开始前 1 小时才能签到'
-    });
-  }
-  const lat = Number(req.body.lat);
-  const lng = Number(req.body.lng);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    return res.status(400).json({ ok: false, message: '未获取到有效位置' });
-  }
-  const distance = Math.round(distanceMeters(lat, lng, event.coords.lat, event.coords.lng));
-  if (distance > event.checkinRadius) {
-    return res.status(403).json({
-      ok: false,
-      distance,
-      message: `签到失败：你距离球场约 ${distance} 米，需在 ${event.checkinRadius} 米范围内`
-    });
-  }
+  const where = atTheField(event, req.body);
+  if (where.status) return res.status(where.status).json(where.body);
   // The coordinates go in with the time, as the evidence behind the row.
-  await db.checkInToEvent(event.id, email, { lat, lng, distance });
-  res.json({ ok: true, distance, message: `签到成功！(距球场约 ${distance} 米)` });
+  await db.checkInToEvent(event.id, email, where);
+  res.json({ ok: true, distance: where.distance, message: `签到成功！(距球场约 ${where.distance} 米)` });
+}));
+
+// 代签到 — an admin standing at the pitch checking in a member who can't do it
+// themselves (a dead phone, no signal, no app). It is deliberately *not* a way
+// around the geofence: every gate the member's own check-in passes is applied
+// here too, and the position measured and stored is the **admin's**, because the
+// admin is the one who is actually there. What makes the row different is
+// `checked_in_by`: the roster renders it as a 代 badge naming who did it, so a
+// proxy check-in is never mistaken for the member having turned up with a phone.
+// Fines are untouched by this — `lateness` reads `checked_in_at` alone, so a
+// member checked in late by an admin owes exactly what they would have owed.
+app.post('/event/:id/checkin-for', requireAdminApi, wrap(async (req, res) => {
+  // No `canSeeEvent` here, like every other admin-only route: an admin sees
+  // every event, so the rule could only ever pass.
+  const event = await db.getEvent(req.params.id);
+  if (!event) return res.status(404).json({ ok: false, message: '活动不存在' });
+  if (!event.coords) return res.status(400).json({ ok: false, message: '该活动为线上活动，无需到场签到' });
+  if (hasEnded(event)) return res.status(400).json({ ok: false, message: '活动已结束，无法签到' });
+  const target = String(req.body.email || '').trim().toLowerCase();
+  const theirs = event.roster.find(s => s.email === target);
+  if (!theirs) return res.status(400).json({ ok: false, message: '该成员未报名本次活动' });
+  if (theirs.status === db.WAITLIST) {
+    return res.status(400).json({ ok: false, message: '该成员在候补名单中，补位成功后才能签到' });
+  }
+  if (theirs.checkedInAt) return res.json({ ok: true, email: target, message: '该成员已签到过了' });
+  const where = atTheField(event, req.body);
+  if (where.status) return res.status(where.status).json(where.body);
+  await db.checkInToEvent(event.id, target, { ...where, by: req.session.user.email });
+  res.json({
+    ok: true,
+    email: target,
+    distance: where.distance,
+    message: `代签到成功！(距球场约 ${where.distance} 米)`
+  });
 }));
 
 // The member list doubles as the admin bulk-add page, so both the plain GET and
@@ -857,6 +984,19 @@ function validateEvent(event) {
   if (!Number.isInteger(event.checkinRadius) || event.checkinRadius <= 0) {
     return 'checkinRadius 必须为正整数';
   }
+  // 总人数（包含试训、guest）is optional and stays optional: an empty box means
+  // "not recorded" and is coerced to null, which is what every event carries
+  // until an admin fills it in. `Number('')` is 0, so the empty cases have to be
+  // caught *before* the coercion or a blank field would record a headcount of 0.
+  if (event.totalHeadcount === undefined || event.totalHeadcount === null
+    || (typeof event.totalHeadcount === 'string' && !event.totalHeadcount.trim())) {
+    event.totalHeadcount = null;
+  } else {
+    event.totalHeadcount = Number(event.totalHeadcount);
+    if (!Number.isInteger(event.totalHeadcount) || event.totalHeadcount < 0) {
+      return 'totalHeadcount 必须为非负整数或留空';
+    }
+  }
   // Coerced in place to one of the column's three shapes, so what the routes
   // then hand to `db.createEvent`/`updateEvent` is already normalized.
   try {
@@ -895,10 +1035,16 @@ app.put('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
   if (!event || !db.canSeeEvent(event, await viewer(req))) {
     return res.status(404).json({ ok: false, message: '活动不存在' });
   }
+  // A finished event is fixed: it exists and can be read, so this is a 400 and
+  // not the 404 a hidden one answers. It also closes the last way its roster
+  // could still move — raising `capacity` promotes off the waitlist.
+  if (hasEnded(event)) {
+    return res.status(400).json({ ok: false, message: '活动已结束，无法修改' });
+  }
 
   // `date`/`endDate`/`time` are derived from these two by `rowToEvent` and are
   // read-only — writing them would be silently dropped, so they are not listed.
-  const EDITABLE_FIELDS = ['title', 'startAt', 'endAt', 'location', 'coords', 'description', 'capacity', 'checkinRadius', 'visibility'];
+  const EDITABLE_FIELDS = ['title', 'startAt', 'endAt', 'location', 'coords', 'description', 'capacity', 'checkinRadius', 'totalHeadcount', 'visibility'];
   for (const field of EDITABLE_FIELDS) {
     if (req.body[field] !== undefined) event[field] = req.body[field];
   }
@@ -925,6 +1071,9 @@ app.post('/api/events', requireAdminApi, wrap(async (req, res) => {
     // from the event page's test-settings card.
     coords: req.body.coords === undefined ? null : req.body.coords,
     checkinRadius: req.body.checkinRadius === undefined ? 10 : req.body.checkinRadius,
+    // Left null by `validateEvent` when the form's box was blank, which is the
+    // normal case for an event that has not happened yet.
+    totalHeadcount: req.body.totalHeadcount,
     // Open to every member unless the form says otherwise.
     visibility: req.body.visibility === undefined ? db.VISIBLE_ALL : req.body.visibility
   };

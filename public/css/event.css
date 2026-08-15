@@ -20,6 +20,13 @@
   color: var(--gsf-ink-soft);
 }
 
+/* The head can carry a second count (总人数). Each is its own line rather than
+   one wrapped sentence: the block sits in the ~300px col-md-4 sidebar, where
+   "总人数（包含试训、guest）：11" is already close to the full width. */
+.roster-count {
+  display: block;
+}
+
 .roster {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(4rem, 1fr));
@@ -37,9 +44,13 @@
   text-align: center;
 }
 
+/* Width pinned to the image's, not left to shrink-wrap: the 代签到 strip below
+   is an in-flow child of this box and caps itself at `max-width: 100%`, so this
+   is what "no wider than the avatar" actually resolves against. */
 .roster-avatar {
   position: relative;
   display: block;
+  width: 48px;
 }
 
 /* `object-fit` matters: a member's own profile_photo is an arbitrary URL at an
@@ -73,6 +84,83 @@
   background: #28a745;
   color: #fff;
   font-size: .5rem;
+}
+
+/* A late check-in takes the green ring's slot, in red: the member did turn up,
+   so the avatar is still marked — just not as a clean arrival. */
+.roster-avatar.is-late img {
+  border-color: #dc3545;
+  box-shadow: 0 0 0 2px rgba(220, 53, 69, .3);
+}
+
+/* The fine, as dollar signs. Red *signs* on white rather than a solid red pill:
+   at 10px a glyph knocked out of a red badge is much harder to count, and one
+   vs two signs is the whole message. The white ring is a box-shadow, not a
+   border, so the red outline stays hairline-thin at this size. `$$` is wider
+   than `$`, hence the pill shape shared with `.roster-queue`. */
+.roster-fine {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.125rem;
+  height: 1.125rem;
+  padding: 0 .1875rem;
+  border-radius: .5625rem;
+  border: 1px solid #dc3545;
+  box-shadow: 0 0 0 2px #fff;
+  background: #fff;
+  color: #dc3545;
+  font-size: .625rem;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -.02em;
+}
+
+/* 代签到 — an admin checked this member in for them. Both corner slots of the
+   avatar are already spoken for (a proxy check-in is still a check-in, so it
+   always carries the tick or the fine), and this mark has a name attached
+   rather than being a glyph, so it sits under the avatar at its left edge
+   instead of on it: in normal flow inside the 48px `.roster-avatar`, which is
+   what `max-width: 100%` below measures against. The circle holds its size and
+   the name is the half that gives way — one line, ellipsised — so the whole
+   strip can never be wider than the avatar and no name can widen the column.
+   Blue rather than the green of an arrival or the red of a fine: it says *how*
+   the check-in happened, not whether it counts. */
+.roster-proxy {
+  display: flex;
+  align-items: center;
+  gap: .125rem;
+  max-width: 100%;
+  /* Clears the tick/fine badge, which dips 1px past the avatar's bottom edge. */
+  margin-top: .1875rem;
+  font-size: .5625rem;
+  line-height: 1;
+  color: var(--gsf-ink-soft);
+}
+
+/* `inline-flex`, because this same mark is reused inline in the legend below. */
+.roster-proxy-mark {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: .875rem;
+  height: .875rem;
+  border-radius: 50%;
+  background: var(--gsf-600);
+  color: #fff;
+  font-size: .5rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.roster-proxy-by {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* A waitlisted member is on the same grid, one block below, but has no place at
@@ -131,6 +219,69 @@
   color: #28a745;
 }
 
+/* The legend gains a second and third entry once anybody is fined, and it lives
+   in the ~300px sidebar — so the entries wrap as a sentence rather than sitting
+   on a row that would overflow. */
+.roster-legend-sep {
+  color: var(--gsf-line);
+}
+
+.roster-fine-sample {
+  color: #dc3545;
+  font-weight: 700;
+}
+
+/* 罚款统计 — the tally of a finished event, one line per tier. Deliberately a
+   tinted panel rather than a `.card`: it is a verdict on the roster above, not
+   another section of the page, and the red wash is what makes it read that way
+   at a glance on a phone. */
+.event-fines {
+  padding: .875rem 1rem;
+  border: 1px solid rgba(220, 53, 69, .25);
+  border-left: 3px solid #dc3545;
+  border-radius: .375rem;
+  background: rgba(220, 53, 69, .04);
+}
+
+.event-fines-head {
+  margin-bottom: .5rem;
+  font-size: .9375rem;
+  font-weight: 600;
+  color: var(--gsf-ink-soft);
+}
+
+/* The name lists wrap freely; the tier is what must never break off its line. */
+.event-fine-row {
+  margin-bottom: .375rem;
+  font-size: .9375rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.event-fine-amount {
+  display: inline-block;
+  min-width: 2.25rem;
+  margin-right: .25rem;
+  color: #dc3545;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* $10 is the heavier of the two, and the pair are read against each other. */
+.event-fine-amount.is-heavy {
+  color: #a71d2a;
+}
+
+.event-fine-names.is-empty {
+  color: var(--gsf-ink-soft);
+}
+
+.event-fine-note {
+  margin-top: .625rem;
+  font-size: .8125rem;
+  color: var(--gsf-ink-soft);
+}
+
 /* Check-in row: the button and the reason it is (not) usable. Phone first — the
    button takes the full width with its hint underneath, and the two share a line
    from `sm` up, where a full-bleed button in the details column looks broken. */
@@ -162,10 +313,33 @@
   100% { box-shadow: 0 0 0 0 rgba(40, 167, 69, 0); }
 }
 
+/* Past kick-off and still not checked in. The button is already amber by then
+   (Bootstrap's `btn-warning`, swapped in by `setUrgent`); this is the other half
+   of the same signal — the ring goes amber to match, and 50% faster, which is
+   1.2s against the calm state's 1.8s. Only the duration and the colour change:
+   the geometry stays identical so the two states read as one thing speeding up
+   rather than as two different animations. */
+.btn-checkin.is-urgent.is-ready {
+  animation-name: checkin-pulse-urgent;
+  animation-duration: 1s;
+}
+
+@keyframes checkin-pulse-urgent {
+  0%   { box-shadow: 0 0 0 0 rgba(255, 193, 7, .7); }
+  70%  { box-shadow: 0 0 0 .875rem rgba(255, 193, 7, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 193, 7, 0); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .btn-checkin.is-ready {
     animation: none;
     box-shadow: 0 0 0 .1875rem rgba(40, 167, 69, .4);
+  }
+
+  /* No animation to speed up, so urgency is carried by the ring's colour alone. */
+  .btn-checkin.is-urgent.is-ready {
+    animation: none;
+    box-shadow: 0 0 0 .1875rem rgba(255, 193, 7, .65);
   }
 }
 
@@ -178,6 +352,14 @@
 
 .checkin-hint.is-ready {
   color: #28a745;
+  font-weight: 600;
+}
+
+/* "活动已开始，请赶快到场签到" — a warning, so it is weighted and coloured like
+   one. Bootstrap's own `warning` amber is too pale to read as body text on
+   white; this is the darker text tone from its warning alert. */
+.checkin-hint.is-urgent {
+  color: #856404;
   font-weight: 600;
 }
 
@@ -229,6 +411,35 @@
 
 .event-action-note {
   font-size: .9375rem;
+}
+
+/* 代签到 dialog. The status line is the whole gate made visible — why the 签到
+   button is or isn't usable — so it gets the same three tones the check-in hint
+   uses, and enough padding to read as a panel rather than a caption. */
+.proxy-note {
+  margin-bottom: 1rem;
+  font-size: .8125rem;
+  line-height: 1.5;
+  color: var(--gsf-ink-soft);
+}
+
+.proxy-status {
+  padding: .5rem .625rem;
+  border-radius: .25rem;
+  background: var(--gsf-outside);
+  font-size: .875rem;
+  color: var(--gsf-ink-soft);
+}
+
+.proxy-status.is-ready {
+  background: rgba(40, 167, 69, .1);
+  color: #28a745;
+  font-weight: 600;
+}
+
+.proxy-status.is-error {
+  background: rgba(220, 53, 69, .08);
+  color: #dc3545;
 }
 
 /* 确认删除 sits in a <form> so it can POST, but the footer's flex layout — and

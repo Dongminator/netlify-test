@@ -70,7 +70,7 @@
                 searches Nominatim, and picking a result fills it and drops the pin. The
                 results list is a sibling of .field-inline-sm, not a child — under sm that
                 class turns its children into one flex row, and the list would join it. %>
-            <div class="form-group col-sm-8">
+            <div class="form-group col-12">
               <div class="field-inline-sm">
                 <label for="ev-location">地点</label>
                 <input class="form-control" id="ev-location" name="location" type="text" maxlength="120"
@@ -80,10 +80,26 @@
               </div>
               <div class="ev-search-results d-none" id="ev-search-results"></div>
             </div>
-            <div class="form-group field-inline-sm col-sm-4">
+          </div>
+
+          <%# The two headcounts, side by side because they are read together and
+              mean different things: 人数上限 is the number of app places the
+              waitlist is measured against, 总人数 is what actually turned up
+              including people who have no account here. 总人数 is deliberately
+              **optional** — an event that has not happened yet has no answer, and
+              a blank box stores NULL rather than 0. The .form-text hint is hidden
+              under sm by .field-inline-sm, so the placeholder repeats it. %>
+          <div class="form-row">
+            <div class="form-group field-inline-sm col-sm-6">
               <label for="ev-capacity">人数上限</label>
               <input class="form-control" id="ev-capacity" name="capacity" type="number" min="0" step="1" required
                      value="<%= isEdit ? formEvent.capacity : 22 %>">
+            </div>
+            <div class="form-group field-inline-sm col-sm-6">
+              <label for="ev-headcount">总人数</label>
+              <input class="form-control" id="ev-headcount" name="totalHeadcount" type="number" min="0" step="1"
+                     placeholder="包含试训、guest，可留空" value="<%= val('totalHeadcount') %>">
+              <small class="form-text text-muted">包含试训、guest。留空表示未统计。</small>
             </div>
           </div>
 
@@ -582,7 +598,12 @@
         endAt: f.end.value.slice(0, 16),
         location: f.location.value.trim(),
         description: f.description.value.trim(),
-        capacity: Number(f.capacity.value)
+        capacity: Number(f.capacity.value),
+        // Optional: an empty box is sent as null ("not recorded"), never as the
+        // 0 that Number('') would produce. The server applies the same rule.
+        totalHeadcount: f.totalHeadcount.value.trim() === ''
+          ? null
+          : Number(f.totalHeadcount.value)
       };
       if (!body.title) return fail('请填写活动名称');
       if (!DT_RE.test(body.startAt)) return fail('请选择开始日期和时间');
@@ -590,6 +611,13 @@
       // Fixed-width and same format, so string order is time order — the same
       // comparison the server and the SQL CHECK make.
       if (body.endAt <= body.startAt) return fail('结束时间必须晚于开始时间');
+      // null is the valid "not recorded" case and passes straight through; only a
+      // filled-in box is checked. The server repeats this — it is the authority.
+      if (body.totalHeadcount !== null
+        && (!isFinite(body.totalHeadcount) || body.totalHeadcount < 0
+          || Math.floor(body.totalHeadcount) !== body.totalHeadcount)) {
+        return fail('总人数必须为非负整数，或留空');
+      }
 
       // Two controls, one stored column: 指定成员 sends the chosen address, the
       // other two send their own keyword.

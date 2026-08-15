@@ -76,6 +76,15 @@ CREATE TABLE IF NOT EXISTS gsffc.events (
   description TEXT,
   capacity    INTEGER NOT NULL DEFAULT 0,
   checkin_radius INTEGER NOT NULL DEFAULT 10,
+  -- 总人数（包含试训、guest）: the headcount the admin records by hand, counting
+  -- everyone who turned up — trialists and guests included — not just the members
+  -- who signed up in the app. Deliberately NOT derived from the roster and never
+  -- written by a signup or a check-in; the roster count and this one answer
+  -- different questions and are shown side by side. NULL means "not recorded",
+  -- which is what every event reads as until an admin fills it in, and is why the
+  -- column is nullable with no default rather than NOT NULL DEFAULT 0 — a 0 would
+  -- claim nobody came.
+  total_headcount INTEGER,
   visibility  TEXT NOT NULL DEFAULT 'ALL',
   CONSTRAINT events_end_after_start CHECK (end_at > start_at),
   CONSTRAINT events_visibility_shape CHECK (visibility IN ('ALL', 'ADMIN') OR visibility LIKE '%@%')
@@ -105,6 +114,13 @@ CREATE TABLE IF NOT EXISTS gsffc.event_signups (
 -- One row per check-in. `checked_in_at` is the arrival time; the coordinates and
 -- the distance the server computed are kept as the evidence behind it.
 -- A member may only check in while SIGNED_UP, and withdrawing deletes the row.
+--
+-- `checked_in_by` is 代签到: the admin who checked this member in on their
+-- behalf, from POST /event/:id/checkin-for. NULL for the ordinary case — a
+-- member checking themselves in — so a non-null value *is* the flag the event
+-- page's 代 badge tests. When it is set, `lat`/`lng`/`distance_m` are the
+-- **admin's** position, because the admin is the one who was at the pitch and
+-- passed the geofence. No foreign key, for the same reason `email` has none.
 CREATE TABLE IF NOT EXISTS gsffc.event_checkins (
   event_id      TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,
   email         TEXT NOT NULL,

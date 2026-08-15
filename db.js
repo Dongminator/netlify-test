@@ -74,6 +74,10 @@ function rowToEvent(row, roster = []) {
     description: row.description,
     capacity: row.capacity,
     checkinRadius: row.checkin_radius != null ? row.checkin_radius : 10,
+    // 总人数（包含试训、guest）— recorded by hand, never derived from `roster`.
+    // NULL is "not recorded" and stays distinct from 0 ("nobody came"), so it is
+    // passed through as null rather than defaulted like `checkinRadius` above.
+    totalHeadcount: row.total_headcount != null ? row.total_headcount : null,
     // 'ALL', 'ADMIN', or the one member's email — see `canSeeEvent`. Rows
     // written before the column existed read as 'ALL', the open default.
     visibility: row.visibility || VISIBLE_ALL,
@@ -92,7 +96,11 @@ function rowToSignup(row) {
     // NULL unless the signup started on the waitlist and was moved up later.
     promotedAt: row.promoted_at,
     checkedInAt: row.checked_in_at || null,
-    checkinDistance: row.distance_m != null ? row.distance_m : null
+    checkinDistance: row.distance_m != null ? row.distance_m : null,
+    // The admin who checked this member in on their behalf (代签到). NULL for
+    // the ordinary case — a member who checked themselves in — so a non-null
+    // value *is* the "this was a proxy check-in" flag the roster renders.
+    checkedInBy: row.checked_in_by || null
   };
 }
 
@@ -384,7 +392,7 @@ async function getRosters(ids, client = pool) {
   if (!ids.length) return byEvent;
   const { rows } = await client.query(
     `SELECT s.event_id, s.email, s.status, s.signed_up_at, s.promoted_at,
-            c.checked_in_at, c.distance_m
+            c.checked_in_at, c.distance_m, c.checked_in_by
      FROM ${SCHEMA}.event_signups s
      LEFT JOIN ${SCHEMA}.event_checkins c
        ON c.event_id = s.event_id AND c.email = s.email
@@ -537,19 +545,26 @@ async function clearEventRoster(eventId) {
 // and inside the radius; the coordinates and the distance it computed are stored
 // as the evidence behind the row. Checking in twice keeps the first time, so
 // `checked_in_at` is always the moment of arrival.
+// `by` is the admin who did it on the member's behalf (代签到) and is left NULL
+// for a member checking themselves in — the coordinates then belong to whoever
+// `by` names, since they are the one who was actually at the pitch.
 // Returns the check-in time, or null if there already was one.
-async function checkInToEvent(eventId, email, { lat, lng, distance } = {}) {
+async function checkInToEvent(eventId, email, { lat, lng, distance, by } = {}) {
+  const normalized = String(email || '').trim().toLowerCase();
+  const proxy = String(by || '').trim().toLowerCase();
   const { rows } = await pool.query(
-    `INSERT INTO ${SCHEMA}.event_checkins (event_id, email, lat, lng, distance_m)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO ${SCHEMA}.event_checkins (event_id, email, lat, lng, distance_m, checked_in_by)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (event_id, email) DO NOTHING
      RETURNING checked_in_at`,
     [
       eventId,
-      String(email || '').trim().toLowerCase(),
+      normalized,
       Number.isFinite(lat) ? lat : null,
       Number.isFinite(lng) ? lng : null,
-      Number.isFinite(distance) ? Math.round(distance) : null
+      Number.isFinite(distance) ? Math.round(distance) : null,
+      // Checking yourself in is not a proxy check-in, however the caller phrased it.
+      proxy && proxy !== normalized ? proxy : null
     ]
   );
   return rows[0] ? rows[0].checked_in_at : null;
@@ -561,8 +576,9 @@ async function checkInToEvent(eventId, email, { lat, lng, distance } = {}) {
 async function createEvent(event) {
   const { rows } = await pool.query(
     `INSERT INTO ${SCHEMA}.events
-       (id, title, start_at, end_at, location, lat, lng, description, capacity, checkin_radius, visibility)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       (id, title, start_at, end_at, location, lat, lng, description, capacity, checkin_radius,
+        total_headcount, visibility)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      RETURNING *`,
     [
       crypto.randomBytes(12).toString('hex'),
@@ -575,6 +591,8 @@ async function createEvent(event) {
       event.description,
       event.capacity,
       event.checkinRadius || 10,
+      // `?? null` and not `|| null`: 0 is a legitimate recorded headcount.
+      event.totalHeadcount ?? null,
       normalizeVisibility(event.visibility)
     ]
   );
@@ -594,7 +612,7 @@ async function updateEvent(event) {
       `UPDATE ${SCHEMA}.events SET
          title = $2, start_at = $3, end_at = $4, location = $5,
          lat = $6, lng = $7, description = $8, capacity = $9, checkin_radius = $10,
-         visibility = $11
+         total_headcount = $11, visibility = $12
        WHERE id = $1`,
       [
         event.id,
@@ -607,6 +625,7 @@ async function updateEvent(event) {
         event.description,
         event.capacity,
         event.checkinRadius || 10,
+        event.totalHeadcount ?? null,
         normalizeVisibility(event.visibility)
       ]
     );
