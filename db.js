@@ -32,6 +32,12 @@ const ROLES = [MEMBER, ADMIN];
 const SIGNED_UP = 'SIGNED_UP';
 const WAITLIST = 'WAITLIST';
 
+// The two keyword values of `events.visibility`; anything else in that column is
+// a single member's email address. Constrained by a CHECK in db/schema.sql, so
+// these strings must stay in sync with it.
+const VISIBLE_ALL = 'ALL';
+const VISIBLE_ADMIN = 'ADMIN';
+
 // Direct Postgres connection (Supabase or any Postgres). This must be a
 // Postgres connection string (postgres://...), NOT the Supabase REST API URL.
 const pool = new Pool({
@@ -68,6 +74,9 @@ function rowToEvent(row, roster = []) {
     description: row.description,
     capacity: row.capacity,
     checkinRadius: row.checkin_radius != null ? row.checkin_radius : 10,
+    // 'ALL', 'ADMIN', or the one member's email — see `canSeeEvent`. Rows
+    // written before the column existed read as 'ALL', the open default.
+    visibility: row.visibility || VISIBLE_ALL,
     roster,
     signups: roster.filter(s => s.status === SIGNED_UP).map(s => s.email),
     waitlist: roster.filter(s => s.status === WAITLIST).map(s => s.email),
@@ -85,6 +94,39 @@ function rowToSignup(row) {
     checkedInAt: row.checked_in_at || null,
     checkinDistance: row.distance_m != null ? row.distance_m : null
   };
+}
+
+// Coerce a submitted visibility into one of the column's three shapes: the two
+// keywords (uppercased, so a form posting 'all' still lands on 'ALL') or a
+// single lowercase email address. Throws on anything else rather than storing
+// it — the CHECK in db/schema.sql would refuse it as a 500 further down.
+function normalizeVisibility(value) {
+  const raw = String(value == null ? '' : value).trim();
+  if (!raw) return VISIBLE_ALL;
+  const upper = raw.toUpperCase();
+  if (upper === VISIBLE_ALL || upper === VISIBLE_ADMIN) return upper;
+  const email = raw.toLowerCase();
+  if (!email.includes('@')) throw new Error('可见范围必须为 ALL、ADMIN 或某个成员的账号');
+  return email;
+}
+
+// **The** rule for who may see an event, applied by every route that hands one
+// out (the calendar, the event page, the JSON API) and by every route that
+// writes to its roster. `user` is `{email, role}` — and `role` must be the one
+// re-read from the database, not the session's 30-day-old copy: this is an
+// access decision, not a rendering one.
+//
+// An administrator sees everything, whatever the column says. Without that an
+// admin could publish an event only one member can see and then be unable to
+// edit, clear or delete it — and the member could do none of those either.
+function canSeeEvent(event, user) {
+  if (!event) return false;
+  if (!user || !user.email) return false;
+  if (user.role === ADMIN) return true;
+  const visibility = event.visibility || VISIBLE_ALL;
+  if (visibility === VISIBLE_ALL) return true;
+  if (visibility === VISIBLE_ADMIN) return false;
+  return visibility === String(user.email).trim().toLowerCase();
 }
 
 async function getUsers() {
@@ -519,8 +561,8 @@ async function checkInToEvent(eventId, email, { lat, lng, distance } = {}) {
 async function createEvent(event) {
   const { rows } = await pool.query(
     `INSERT INTO ${SCHEMA}.events
-       (id, title, start_at, end_at, location, lat, lng, description, capacity, checkin_radius)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       (id, title, start_at, end_at, location, lat, lng, description, capacity, checkin_radius, visibility)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING *`,
     [
       crypto.randomBytes(12).toString('hex'),
@@ -532,7 +574,8 @@ async function createEvent(event) {
       event.coords ? event.coords.lng : null,
       event.description,
       event.capacity,
-      event.checkinRadius || 10
+      event.checkinRadius || 10,
+      normalizeVisibility(event.visibility)
     ]
   );
   return rowToEvent(rows[0]);
@@ -550,7 +593,8 @@ async function updateEvent(event) {
     await client.query(
       `UPDATE ${SCHEMA}.events SET
          title = $2, start_at = $3, end_at = $4, location = $5,
-         lat = $6, lng = $7, description = $8, capacity = $9, checkin_radius = $10
+         lat = $6, lng = $7, description = $8, capacity = $9, checkin_radius = $10,
+         visibility = $11
        WHERE id = $1`,
       [
         event.id,
@@ -562,7 +606,8 @@ async function updateEvent(event) {
         event.coords ? event.coords.lng : null,
         event.description,
         event.capacity,
-        event.checkinRadius || 10
+        event.checkinRadius || 10,
+        normalizeVisibility(event.visibility)
       ]
     );
     return { promoted: await promoteFromWaitlist(client, event.id, Number(event.capacity)) };
@@ -585,6 +630,7 @@ async function deleteEvent(id) {
 
 module.exports = {
   pool, ROLES, MEMBER, ADMIN, SIGNED_UP, WAITLIST,
+  VISIBLE_ALL, VISIBLE_ADMIN, normalizeVisibility, canSeeEvent,
   getUsers, getUserByEmail, verifyPassword, createUser, upsertUser, updateUser, deleteUser,
   setUserPhoto, getUserPhoto,
   getEvents, getEvent, createEvent, updateEvent, deleteEvent,

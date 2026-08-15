@@ -143,6 +143,34 @@ function requireSelfOrAdminApi(req, res, next) {
   return requireAdminApi(req, res, next);
 }
 
+// The viewer, in the shape `db.canSeeEvent` wants — with the role re-read from
+// the database rather than taken from the session's copy, which can be 30 days
+// stale. Event visibility is an access decision, so it gets the same treatment
+// as `adminGuard`: one query, and the session copy refreshed along the way so a
+// demoted admin stops seeing admin-only events at once.
+// Pass `role` when the caller has already read the row (the event page reads
+// every member to build its roster, so the viewer's fresh row is already in
+// hand) and this costs nothing at all.
+async function viewer(req, role) {
+  const email = req.session.user.email;
+  if (role === undefined) {
+    const fresh = await db.getUserByEmail(email);
+    role = fresh ? fresh.role : db.MEMBER;
+  }
+  req.session.user.role = role;
+  return { email, role };
+}
+
+// What an event's visibility says, for the badge on its page and the calendar
+// chip's tooltip. `nameOf` turns the stored address into the member's name when
+// there is an account behind it. Null for an ordinary, everyone-can-see event.
+function visibilityLabel(event, nameOf) {
+  if (!event || !event.visibility || event.visibility === db.VISIBLE_ALL) return null;
+  if (event.visibility === db.VISIBLE_ADMIN) return '仅管理员可见';
+  const name = nameOf ? nameOf(event.visibility) : '';
+  return `仅 ${name || event.visibility} 可见`;
+}
+
 // Fallback avatar scheme, same as the production app (hackathon-starter gravatar
 // helper). Used whenever a member has no `profile_photo` of their own; `size` is
 // a gravatar parameter and has no equivalent for a stored photo, which is sized
@@ -297,8 +325,25 @@ app.get('/logout', (req, res) => {
 });
 
 app.get('/calendar', requireLogin, wrap(async (req, res) => {
-  const events = await db.getEvents();
+  const me = await viewer(req);
+  const isAdmin = me.role === db.ADMIN;
+  // Restricted events are not merely hidden from the grid — they are dropped
+  // here, before anything is built out of them, so nothing downstream (a count,
+  // a tooltip, the picker's map centre) can leak one.
+  const events = (await db.getEvents()).filter(e => db.canSeeEvent(e, me));
   const today = todayStr();
+  // The add-event modal's 指定成员 picker. Only admins see the modal at all, so
+  // only they pay for the extra query.
+  const members = isAdmin
+    ? (await db.getUsers()).map(u => ({ email: u.email, name: u.name }))
+    : [];
+  const nameOf = email => {
+    const m = members.find(u => u.email === email);
+    return m ? m.name : '';
+  };
+  // What the chip's lock icon and tooltip say. Set on the event objects
+  // themselves because `buildMonthGrid` hands the very same ones to the grid.
+  for (const e of events) e.visibilityNote = visibilityLabel(e, nameOf);
 
   // ?month=YYYY-MM drives the grid; anything malformed falls back to this month.
   // "This month" comes out of the club-local date, not the process's own clock —
@@ -338,6 +383,9 @@ app.get('/calendar', requireLogin, wrap(async (req, res) => {
     // back here, onto the month the deleted event was in, with ?deleted=1.
     deleted: req.query.deleted === '1',
     mapCenter,
+    // The 指定成员 options in the event modal; empty for a non-admin, who never
+    // renders the modal.
+    members,
     // What the modal's date field starts on: today when it is in view, so the
     // common case needs no picking, otherwise the 1st of the month being viewed.
     defaultDate: year === thisYear && month === thisMonth ? today : ymd(year, month, 1)
@@ -349,6 +397,13 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
   if (!event) return res.status(404).render('404', { title: 'Not Found' });
   const users = await db.getUsers();
   const byEmail = new Map(users.map(u => [u.email, u]));
+  // The viewer's own row is already in that map, so the freshly-read role the
+  // visibility rule needs costs no extra query here. An event the viewer may
+  // not see answers exactly as a missing one does — a 403 would confirm it
+  // exists, which is the one thing a hidden event must not do.
+  const mineRow = byEmail.get(req.session.user.email);
+  const me = await viewer(req, mineRow ? mineRow.role : db.MEMBER);
+  if (!db.canSeeEvent(event, me)) return res.status(404).render('404', { title: 'Not Found' });
   // `event.roster` is already ordered — confirmed members first, then the
   // waitlist, each half oldest signup first — so the index inside each half is
   // the member's place in it.
@@ -390,12 +445,22 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     // Set by the redirect from POST /event/:id/signup when the event was full.
     joinedWaitlist: req.query.joined === 'waitlist',
     isPast: hasEnded(event),
-    // The check-in window, as an absolute instant, plus the clock the server
-    // measured it against: the page counts down against `Date.now()` corrected
+    // The check-in window, as two absolute instants, plus the clock the server
+    // measured them against: the page counts down against `Date.now()` corrected
     // by the difference, so a phone whose clock is off doesn't offer a button
-    // the route will refuse (or hide one it would accept).
+    // the route will refuse (or hide one it would accept). The close is on the
+    // page too, so an event that ends while it sits open closes the button
+    // itself instead of leaving one the route answers 400 to.
     checkinOpensAt: checkinOpensAt(event),
-    serverNow: Date.now()
+    checkinClosesAt: clubEpoch(event.endAt),
+    serverNow: Date.now(),
+    // Non-null only for a restricted event — the badge beside the title.
+    visibilityNote: visibilityLabel(event, email => {
+      const u = byEmail.get(email);
+      return u ? u.name : '';
+    }),
+    // Options for the 指定成员 picker in the admin edit modal.
+    members: me.role === db.ADMIN ? users.map(u => ({ email: u.email, name: u.name })) : []
   });
 }));
 
@@ -404,6 +469,14 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
 // page can say so. The capacity decision is made under a row lock in there, not
 // here, so two members racing for the last place can't both take it.
 app.post('/event/:id/signup', requireLogin, wrap(async (req, res) => {
+  // An event you may not see is one you may not join, and it answers as a
+  // missing one rather than as a refusal. Withdrawing deliberately carries no
+  // such check — a member whose event was restricted after they signed up must
+  // still be able to take their place back out of it.
+  const event = await db.getEvent(req.params.id);
+  if (!event || !db.canSeeEvent(event, await viewer(req))) {
+    return res.status(404).render('404', { title: 'Not Found' });
+  }
   const result = await db.signUpForEvent(req.params.id, req.session.user.email);
   if (!result) return res.status(404).render('404', { title: 'Not Found' });
   const waitlisted = result.created && result.status === db.WAITLIST;
@@ -444,6 +517,10 @@ app.post('/event/:id/delete', requireAdmin, wrap(async (req, res) => {
 app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
   const event = await db.getEvent(req.params.id);
   if (!event) return res.status(404).json({ ok: false, message: '活动不存在' });
+  // Same answer as a missing event, for the same reason as the signup route.
+  if (!db.canSeeEvent(event, await viewer(req))) {
+    return res.status(404).json({ ok: false, message: '活动不存在' });
+  }
   if (!event.coords) return res.status(400).json({ ok: false, message: '该活动为线上活动，无需到场签到' });
   if (hasEnded(event)) {
     return res.status(400).json({ ok: false, message: '活动已结束，无法签到' });
@@ -780,31 +857,52 @@ function validateEvent(event) {
   if (!Number.isInteger(event.checkinRadius) || event.checkinRadius <= 0) {
     return 'checkinRadius 必须为正整数';
   }
+  // Coerced in place to one of the column's three shapes, so what the routes
+  // then hand to `db.createEvent`/`updateEvent` is already normalized.
+  try {
+    event.visibility = db.normalizeVisibility(event.visibility);
+  } catch (err) {
+    return err.message;
+  }
   return null;
+}
+
+// The half of the visibility check that needs the database: a visibility naming
+// a member only means something if that member exists — a typo would otherwise
+// create an event literally nobody but an admin can see. Returns the complaint,
+// or null when the value is fine.
+async function checkVisibilityTarget(visibility) {
+  if (visibility === db.VISIBLE_ALL || visibility === db.VISIBLE_ADMIN) return null;
+  return (await db.getUserByEmail(visibility)) ? null : `找不到成员 ${visibility}`;
 }
 
 // JSON API — no delete; creating is admin-only, editing is not (POC)
 app.get('/api/events', requireLoginApi, wrap(async (req, res) => {
-  res.json(await db.getEvents());
+  const me = await viewer(req);
+  res.json((await db.getEvents()).filter(e => db.canSeeEvent(e, me)));
 }));
 
 app.get('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
   const event = await db.getEvent(req.params.id);
-  if (!event) return res.status(404).json({ ok: false, message: '活动不存在' });
+  if (!event || !db.canSeeEvent(event, await viewer(req))) {
+    return res.status(404).json({ ok: false, message: '活动不存在' });
+  }
   res.json(event);
 }));
 
 app.put('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
   const event = await db.getEvent(req.params.id);
-  if (!event) return res.status(404).json({ ok: false, message: '活动不存在' });
+  if (!event || !db.canSeeEvent(event, await viewer(req))) {
+    return res.status(404).json({ ok: false, message: '活动不存在' });
+  }
 
   // `date`/`endDate`/`time` are derived from these two by `rowToEvent` and are
   // read-only — writing them would be silently dropped, so they are not listed.
-  const EDITABLE_FIELDS = ['title', 'startAt', 'endAt', 'location', 'coords', 'description', 'capacity', 'checkinRadius'];
+  const EDITABLE_FIELDS = ['title', 'startAt', 'endAt', 'location', 'coords', 'description', 'capacity', 'checkinRadius', 'visibility'];
   for (const field of EDITABLE_FIELDS) {
     if (req.body[field] !== undefined) event[field] = req.body[field];
   }
-  const error = validateEvent(event);
+  const error = validateEvent(event) || await checkVisibilityTarget(event.visibility);
   if (error) return res.status(400).json({ ok: false, message: error });
 
   await db.updateEvent(event);
@@ -826,9 +924,11 @@ app.post('/api/events', requireAdminApi, wrap(async (req, res) => {
     // New events are created without a check-in point; it is picked afterwards
     // from the event page's test-settings card.
     coords: req.body.coords === undefined ? null : req.body.coords,
-    checkinRadius: req.body.checkinRadius === undefined ? 10 : req.body.checkinRadius
+    checkinRadius: req.body.checkinRadius === undefined ? 10 : req.body.checkinRadius,
+    // Open to every member unless the form says otherwise.
+    visibility: req.body.visibility === undefined ? db.VISIBLE_ALL : req.body.visibility
   };
-  const error = validateEvent(event);
+  const error = validateEvent(event) || await checkVisibilityTarget(event.visibility);
   if (error) return res.status(400).json({ ok: false, message: error });
 
   res.status(201).json(await db.createEvent(event));

@@ -11,6 +11,12 @@
 <div class="pb-2 mt-2 mb-4 border-bottom">
   <h3 class="mb-0"><%= event.title %>
     <% if (isPast) { %><span class="badge badge-secondary">已结束</span><% } %>
+    <%# Non-null only when the event is restricted — and only somebody allowed to
+        see it ever reaches this page, so the badge says who it is limited to
+        rather than that it is hidden. %>
+    <% if (visibilityNote) { %>
+      <span class="badge badge-warning"><i class="fas fa-lock mr-1" aria-hidden="true"></i><%= visibilityNote %></span>
+    <% } %>
   </h3>
 </div>
 
@@ -241,24 +247,62 @@
     var status = document.getElementById('position-status');
     var hint = document.getElementById('checkin-hint');
     var lastPos = null;
+    var lastFixAt = 0;      // when that fix landed, on the corrected clock
+    var watchId = null;     // the live watchPosition registration, if any
     var userMarker = null;
     var accuracyCircle = null;
 
-    // The two gates on the button: the check-in window opens an hour before
-    // kick-off, and the member has to be inside the field's radius. `OPENS_AT`
-    // is the same absolute instant the route checks, and the clock it is
-    // compared against is the server's — a phone running a few minutes fast
-    // would otherwise enable a button the route refuses.
+    // The gates on the button: the check-in window opens an hour before kick-off
+    // and closes when the event ends, and the member has to be inside the
+    // field's radius. `OPENS_AT`/`CLOSES_AT` are the same absolute instants the
+    // route checks, and the clock they are compared against is the server's — a
+    // phone running a few minutes fast would otherwise enable a button the route
+    // refuses. Either may be NaN if the stored time is malformed, which every
+    // comparison below falls back through to distance alone.
     var OPENS_AT = <%= checkinOpensAt %>;
+    var CLOSES_AT = <%= checkinClosesAt %>;
     var SKEW = <%= serverNow %> - Date.now();
     var LABEL = '📍 到场签到';
     var inside = null;      // null until the first position fix lands
     var locError = '';      // set when there will be no fix at all
     var submitting = false; // a POST is in flight; the ticker must not undo it
-    var ticker = null;
+    var ticker = null;      // 1s countdown, alive only until the window opens
+    var closeTimer = null;  // one-shot, fires when the window closes
 
     function now() { return Date.now() + SKEW; }
     function pad(n) { return n < 10 ? '0' + n : String(n); }
+
+    // The countdown is driven by a self-rescheduling timeout, not setInterval:
+    // each tick aims at the next whole second of the *corrected* clock and reads
+    // the time afresh, so a phone that froze the page for ten minutes in the
+    // background resumes on the right second instead of resuming ten minutes'
+    // worth of missed ticks behind. (Chrome on Android throttles background
+    // timers to roughly one a minute, and stops them altogether once the tab has
+    // been hidden for a few minutes — which is exactly the lag being fixed.)
+    function stopTicker() {
+      if (ticker) { clearTimeout(ticker); ticker = null; }
+    }
+
+    function tick() {
+      ticker = null;
+      render();
+      startTicker();
+    }
+
+    function startTicker() {
+      if (ticker || !(now() < OPENS_AT)) return;
+      ticker = setTimeout(tick, 1000 - (now() % 1000));
+    }
+
+    // Once the window is open the countdown has nothing left to do, but the
+    // *close* is still ahead: this is what takes the button away the moment the
+    // event ends, rather than leaving one the route answers 400 to.
+    function armCloseTimer() {
+      if (closeTimer || !isFinite(CLOSES_AT)) return;
+      var left = CLOSES_AT - now();
+      if (left <= 0) return;
+      closeTimer = setTimeout(function () { closeTimer = null; render(); }, left + 250);
+    }
 
     function countdown(ms) {
       var total = Math.max(0, Math.ceil(ms / 1000));
@@ -272,7 +316,16 @@
     // position fix and after a failed submit, never from two places at once.
     function render() {
       if (submitting) return;
-      var left = OPENS_AT - now();
+      var t = now();
+      if (isFinite(CLOSES_AT) && t >= CLOSES_AT) {
+        stopTicker();
+        btn.disabled = true;
+        btn.classList.remove('is-ready');
+        hint.className = 'checkin-hint text-muted';
+        hint.textContent = '活动已结束，签到已关闭';
+        return;
+      }
+      var left = OPENS_AT - t;
       if (left > 0) {
         btn.disabled = true;
         btn.classList.remove('is-ready');
@@ -282,8 +335,9 @@
         return;
       }
       // Open from here on, so the countdown has nothing left to do — position
-      // fixes drive the rest.
-      if (ticker) { clearInterval(ticker); ticker = null; }
+      // fixes drive the rest, until the close timer takes the button away.
+      stopTicker();
+      armCloseTimer();
       if (locError) {
         btn.disabled = true;
         btn.classList.remove('is-ready');
@@ -325,6 +379,7 @@
 
     function onPosition(pos) {
       lastPos = pos;
+      lastFixAt = now();
       var lat = pos.coords.latitude, lng = pos.coords.longitude;
       if (!userMarker) {
         userMarker = L.circleMarker([lat, lng], {
@@ -350,25 +405,91 @@
       render();
     }
 
+    function onPositionError(err) {
+      status.textContent = '无法获取位置：' + err.message + '（请允许定位权限后刷新页面）';
+      status.className = 'mb-3 text-danger';
+      // Only fatal while nothing has been received: a dropped fix mid-session
+      // leaves the last known state alone rather than pulling the button.
+      if (inside === null) {
+        locError = '无法获取位置，请允许定位权限后刷新页面';
+        render();
+      }
+    }
+
+    var GEO_OPTS = { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 };
+
+    function startWatch() {
+      if (!navigator.geolocation || watchId !== null) return;
+      watchId = navigator.geolocation.watchPosition(onPosition, onPositionError, GEO_OPTS);
+    }
+
+    // A watch that survived a spell in the background often survives it *silently* —
+    // still registered, no longer delivering. Tearing it down and starting a new
+    // one is the only reliable way to know it is live again.
+    function restartWatch() {
+      if (!navigator.geolocation) return;
+      if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+      startWatch();
+    }
+
+    // One fix, right now, bypassing any cached one. Its failures are ignored on
+    // purpose: this runs alongside the watch, whose error handler already owns
+    // the message, and a single timed-out poll must not blank a good fix.
+    function refreshPosition() {
+      if (!navigator.geolocation) return;
+      navigator.geolocation.getCurrentPosition(onPosition, function () {}, {
+        enableHighAccuracy: true, timeout: 15000, maximumAge: 0
+      });
+    }
+
+    // The backup source. `watchPosition` is the primary one, but it is exactly
+    // what a phone stops servicing while the member is in another app — so
+    // whenever the page is on screen and the newest fix is older than
+    // POSITION_MAX_AGE_MS, one is asked for outright. This is what turns the
+    // button on when somebody walks into the circle after switching back, rather
+    // than waiting for a watch that may never fire again.
+    var POSITION_MAX_AGE_MS = 20000;
+    setInterval(function () {
+      if (document.hidden || locError) return;
+      if (now() - lastFixAt >= POSITION_MAX_AGE_MS) refreshPosition();
+    }, POSITION_MAX_AGE_MS / 2);
+
+    // The page is in front of the member again. Nothing on screen is trusted
+    // after a return from the background: the countdown is re-read from the
+    // clock rather than resumed, the ticker restarted, the watch rebuilt and a
+    // fresh fix requested at once — so both gates are re-evaluated immediately
+    // instead of whenever the phone gets round to the next timer or fix.
+    // Seeded to now so the `pageshow` that fires on this very load doesn't tear
+    // down the watch started just below it.
+    var lastResync = Date.now();
+    function resync() {
+      if (document.hidden) return;
+      render();
+      startTicker();
+      // `focus` and `visibilitychange` both fire on the way back to a tab; one
+      // watch rebuild between them is enough.
+      if (Date.now() - lastResync < 1000) return;
+      lastResync = Date.now();
+      restartWatch();
+      refreshPosition();
+    }
+
+    document.addEventListener('visibilitychange', resync);
+    window.addEventListener('pageshow', resync);
+    window.addEventListener('focus', resync);
+    // A phone that was offline may have had its fixes fail rather than lag.
+    window.addEventListener('online', resync);
+
     if (!navigator.geolocation) {
       locError = '当前浏览器不支持定位，无法签到';
       status.textContent = locError;
       status.className = 'mb-3 text-danger';
     } else {
-      navigator.geolocation.watchPosition(onPosition, function (err) {
-        status.textContent = '无法获取位置：' + err.message + '（请允许定位权限后刷新页面）';
-        status.className = 'mb-3 text-danger';
-        // Only fatal while nothing has been received: a dropped fix mid-session
-        // leaves the last known state alone rather than pulling the button.
-        if (inside === null) {
-          locError = '无法获取位置，请允许定位权限后刷新页面';
-          render();
-        }
-      }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 });
+      startWatch();
     }
 
     render();
-    if (OPENS_AT - now() > 0) ticker = setInterval(render, 1000);
+    startTicker();
 
     btn.addEventListener('click', function () {
       if (!lastPos || btn.disabled) return;

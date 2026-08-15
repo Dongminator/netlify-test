@@ -55,10 +55,14 @@
           <div class="cal-day<%= day.inMonth ? '' : ' is-outside' %><%= day.isToday ? ' is-today' : '' %><%= (day.weekday === 0 || day.weekday === 6) ? ' is-weekend' : '' %>" role="gridcell" data-date="<%= day.date %>">
             <div class="cal-date"><%= day.day %></div>
             <% day.events.forEach(e => { %>
-              <a class="cal-event<%= day.isPast ? ' is-past' : '' %>" href="/event/<%= e.id %>"
-                 title="<%= e.title %> · <%= e.time %> · <%= e.location %>">
+              <%# `visibilityNote` is set by the route and is null for an ordinary
+                  event, so the lock only ever appears on one the viewer is
+                  specifically allowed to see — an admin's view of a restricted
+                  event, or the member it was made for. %>
+              <a class="cal-event<%= day.isPast ? ' is-past' : '' %><%= e.visibilityNote ? ' is-restricted' : '' %>" href="/event/<%= e.id %>"
+                 title="<%= e.title %> · <%= e.time %> · <%= e.location %><%= e.visibilityNote ? ' · ' + e.visibilityNote : '' %>">
                 <span class="cal-event-time"><%= (e.time || '').split(' ')[0] %></span>
-                <span class="cal-event-title"><%= e.title %></span>
+                <span class="cal-event-title"><% if (e.visibilityNote) { %><i class="fas fa-lock cal-event-lock" aria-hidden="true"></i><span class="sr-only"><%= e.visibilityNote %></span><% } %><%= e.title %></span>
               </a>
             <% }) %>
           </div>

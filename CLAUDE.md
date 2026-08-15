@@ -26,8 +26,12 @@ runs it, `db.js` only opens a pool and queries. Consequences to remember:
 - Adding a column means editing `db/schema.sql` *and* applying it manually to every existing database.
 - `db/schema.sql` is the **only** DDL there is — there are no migration files. It is written to be safe
   to re-apply (`CREATE … IF NOT EXISTS`, `ON CONFLICT DO NOTHING`), so an existing database is moved
-  forward by running it again, and anything it cannot express as a create (a new column on a table that
-  already exists, a changed CHECK) is applied by hand in `psql` at the same time.
+  forward by running it again. A new column on an existing table goes in **twice**: in the `CREATE TABLE`
+  for a fresh database, and again as `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for one that already has
+  the table — see `events.visibility`, which does exactly that, with its CHECK added in a `DO $$ …
+  EXCEPTION WHEN duplicate_object $$` block since constraints have no `IF NOT EXISTS`. Both forms are
+  idempotent, so the file stays safe to run as a whole; anything that still can't be expressed that way
+  is applied by hand in `psql` at the same time.
 - `db/schema.sql` seeds only the three events; it seeds **no users**. Members are created from the
   "批量添加会员" modal on `/members` (paste `username:password` lines); its button and the modal
   itself only render for admins.
@@ -99,6 +103,47 @@ are gone from `db/schema.sql` and nothing reads them any more. Consequences:
   new functions in that shape; never mutate an array and re-save the event.
 - `email` carries **no foreign key to `users`** (the seeds name members who may have no account), so
   `deleteUser` still cascades by hand — see below.
+
+**Visibility.** `events.visibility` decides who the event exists for *at all*, in one of three shapes
+held by a CHECK: `'ALL'` (every signed-in member — the default, and what every pre-existing row reads
+as), `'ADMIN'` (administrators only), or **a single member's lowercase email**. `db.normalizeVisibility`
+is what coerces a submitted value into one of the three — uppercasing the keywords, lowercasing an
+address, throwing on anything else — and it is called inside `createEvent`/`updateEvent`, so nothing can
+reach the column unnormalized. `db.canSeeEvent(event, {email, role})` is **the** rule, and
+**an `ADMIN` always sees everything**: without that, an event could be published for one member and then
+be uneditable and undeletable by anyone, including the admin who made it.
+
+It is an access decision, not a rendering one, so it takes the same care as `requireAdmin`: `role` must
+be the row re-read from the database, never `req.session.user.role`, which can be 30 days stale.
+`viewer(req, role?)` in [server.js](server.js#L133) is what produces it — one `getUserByEmail`, with the
+session copy refreshed on the way through, or none at all when the caller already has the fresh row
+(`/event/:id` reads every member for its roster, so the viewer's own row is already in that Map).
+
+**A restricted event answers exactly as a missing one does — 404, never 403**, since a refusal would
+confirm it exists. Every route that hands an event out or writes to its roster applies the rule:
+`/calendar` and `/api/events` **filter the array before anything is built out of it** (so no count,
+tooltip or map centre can leak one), `/event/:id`, `GET|PUT /api/events/:id`, `POST /event/:id/signup`
+and `POST /event/:id/checkin` 404. **Withdrawing is deliberately not gated** — a member whose event was
+restricted after they signed up must still be able to take their place back out of it. The admin-only
+routes (清空报名, 删除活动) need no check, since admins see everything. A new route that hands out an
+event must call `db.canSeeEvent` too.
+
+`visibility` is in `EDITABLE_FIELDS`, so a PUT that omits it keeps the current value. `validateEvent`
+normalizes the shape; the *existence* of a named member needs a query, so it is a separate
+`checkVisibilityTarget` awaited beside it in both write routes — a typo'd address would otherwise create
+an event literally nobody but an admin can see. The address carries **no foreign key** to `users`, for
+the same reason `event_signups.email` doesn't; deleting the member leaves the event admin-only in
+practice, and the modal keeps that address as an option rather than silently re-opening the event when
+the form is next saved.
+
+In the UI it is one `<select>` (所有人 / 仅管理员 / 指定成员) plus a member picker revealed only by the
+third — `syncVisibility` in the modal's script, which `setMode` calls after `form.reset()` like every
+other mode-specific value. Both `<select>`s carry `selected` in the **markup**, not from script, because
+`form.reset()` is what restores the prefill. Both including pages therefore supply a `members` local
+(`{email, name}`, admin-only — `/calendar` pays one extra `getUsers` for it, nobody else does). A
+restricted event shows an amber `.cal-event.is-restricted` chip with a lock on the calendar and a
+`badge-warning` beside the title on its page; both come from `visibilityLabel()` in server.js, which is
+null for an ordinary event, so the lock only ever appears to someone allowed to see the event anyway.
 
 **Waitlist.** `event_signups.status` is `SIGNED_UP` or `WAITLIST`, constrained by a CHECK and mirrored by
 `db.SIGNED_UP`/`db.WAITLIST`. Signing up for a full event is never refused: `signUpForEvent` counts the
@@ -311,15 +356,41 @@ is the display shape only — stored values, the JSON API and the `datetime-loca
 `YYYY-MM-DDTHH:MM`, and `event.date`/`todayStr()` stay `YYYY-MM-DD` because they are *compared*
 lexically, not read. `users.joined` is free-text TEXT and is rendered as stored.
 
-The button has exactly two gates and one renderer. `render()` in [views/event.ejs](views/event.ejs)
+The button has three gates and one renderer. `render()` in [views/event.ejs](views/event.ejs)
 is the only thing that writes `disabled`, the pulse class or the hint beside it, and it is called from
-the 1-second ticker, from every position fix and after a failed POST — never from two places at once.
-Its states are: before the window, disabled with a live countdown; open but outside the radius (or with
-no fix yet), disabled with 到达球场后即可签到; open and inside, enabled with the `is-ready` pulse. The
-ticker stops the moment the window opens, position fixes drive it from there, and a `submitting` flag
-keeps it from re-enabling the button under an in-flight request. Times are compared against the
-server's clock, not the phone's: `SKEW` is the difference measured at render, so a phone running fast
-can't be shown a button the route will refuse. The line under the map stays a pure distance readout —
+the 1-second ticker, from every position fix, on every return to the page and after a failed POST —
+never from two places at once. Its states are: after `CLOSES_AT`, disabled with 活动已结束（a
+`setTimeout` armed at that instant closes the button on an event that ends while the page sits open,
+rather than leaving one the route answers 400 to); before the window, disabled with a live countdown;
+open but outside the radius (or with no fix yet), disabled with 到达球场后即可签到; open and inside,
+enabled with the `is-ready` pulse. The ticker stops the moment the window opens, position fixes drive it
+from there, and a `submitting` flag keeps it from re-enabling the button under an in-flight request.
+Times are compared against the server's clock, not the phone's: `SKEW` is the difference measured at
+render, so a phone running fast can't be shown a button the route will refuse.
+
+**Everything on that page is built to survive the phone backgrounding it**, which is what a member
+actually does between arriving and checking in. Chrome on Android throttles a hidden tab's timers to
+about one a minute and stops them entirely after a few minutes, and it can stop servicing
+`watchPosition` without ever raising an error — so the countdown froze mid-number and the button stayed
+disabled after the member walked into the circle. Three things fix it, and a change to any of them has
+to keep all three:
+
+- **The countdown is a self-rescheduling `setTimeout`, not `setInterval`.** Each tick re-reads the
+  corrected clock and aims at the next whole second of it, so a page frozen for ten minutes resumes on
+  the right second instead of ten minutes' worth of missed ticks behind. `render()` never counts ticks;
+  it only ever subtracts `now()` from an absolute instant, which is what makes that safe.
+- **`resync()` runs on `visibilitychange`, `pageshow`, `focus` and `online`** — every way the page can
+  come back in front of the member. It re-renders from the clock, restarts the ticker, tears the
+  geolocation watch down and starts a **new** one (a watch that survived the background often survives
+  it silently: still registered, no longer delivering) and asks for a fix immediately. The watch rebuild
+  is throttled to once a second, because `focus` and `visibilitychange` both fire on the way back, and
+  `lastResync` is seeded to `Date.now()` so the `pageshow` of the initial load doesn't tear down the
+  watch that was just started.
+- **A backup poll.** While the page is visible and the newest fix is older than `POSITION_MAX_AGE_MS`
+  (20s), `getCurrentPosition({maximumAge: 0})` is called outright. `watchPosition` stays the primary
+  source; this is what turns the button on when somebody walks into the circle and the watch has gone
+  quiet. Its failures are ignored on purpose — the watch's error handler owns the message, and one
+  timed-out poll must not blank a good fix. The line under the map stays a pure distance readout —
 whether the button is usable, and why, is the hint. The `is-ready` pulse is an animated `box-shadow`
 rather than a scaled pseudo-element, because a shadow paints outside the box without widening it: a
 full-width button on a 320px screen would otherwise push the page into horizontal scroll.
@@ -506,8 +577,10 @@ always. It hides the avatar's pencil on the same test. It reads the viewer's own
   and `GET /member-list` are now just redirects to `/members` for old bookmarks, so they need no gate
   of their own.
 - Creating an event is admin-only, and the "编辑" button only renders for admins, but the route behind it
-  (`PUT /api/events/:id`) is still `requireLoginApi` — **any** logged-in member can edit any event by
-  calling it directly, which now includes raising `capacity` to promote themselves off the waitlist.
+  (`PUT /api/events/:id`) is still `requireLoginApi` — **any** logged-in member can edit any event they
+  can *see* by calling it directly, which now includes raising `capacity` to promote themselves off the
+  waitlist, and setting `visibility` (they cannot hide it from an admin, who sees everything, but they
+  can hide it from the rest of the club, or hand themselves an event meant for someone else).
   `POST /event/:id/delete` *is* `requireAdmin`, but it deletes the event and its whole roster
   irreversibly, with no soft-delete and no record of who did it — the same shape as deleting a member.
   There is no JSON delete endpoint under `/api/events/:id`.

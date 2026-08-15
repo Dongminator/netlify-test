@@ -15,6 +15,20 @@
   // `defaultDate` and runs the same two hours the end field defaults to.
   const startValue = isEdit ? formEvent.startAt : defaultDate + 'T10:00';
   const endValue = isEdit ? formEvent.endAt : defaultDate + 'T12:00';
+
+  // 可见范围 is one stored column with three shapes ('ALL' / 'ADMIN' / an email),
+  // shown as two controls: the mode, and — only for the third — which member.
+  // The <select>s carry `selected` in the markup rather than being set from the
+  // script, because `form.reset()` in `setMode` restores exactly what was
+  // rendered, which is what makes the prefill and the copy work.
+  const visibility = (isEdit && formEvent.visibility) || 'ALL';
+  const visibilityMode = visibility === 'ALL' || visibility === 'ADMIN' ? visibility : 'MEMBER';
+  const memberList = locals.members || [];
+  // The named member may have been deleted since; keep them as an option rather
+  // than silently re-opening the event to everyone when the form is saved.
+  const memberOptions = visibilityMode === 'MEMBER' && !memberList.some(m => m.email === visibility)
+    ? [{ email: visibility, name: visibility }, ...memberList]
+    : memberList;
 %>
 <div class="modal fade" id="event-modal" tabindex="-1" role="dialog" aria-labelledby="event-modal-title" aria-hidden="true">
   <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
@@ -70,6 +84,28 @@
               <label for="ev-capacity">人数上限</label>
               <input class="form-control" id="ev-capacity" name="capacity" type="number" min="0" step="1" required
                      value="<%= isEdit ? formEvent.capacity : 22 %>">
+            </div>
+          </div>
+
+          <%# 可见范围: who the event exists for at all. 指定成员 reveals the member
+              picker beside it — the two are one decision, so they share a row and
+              stack on a phone like every other pair here. %>
+          <div class="form-row">
+            <div class="form-group field-inline-sm col-sm-6">
+              <label for="ev-visibility">可见范围</label>
+              <select class="form-control" id="ev-visibility" name="visibility">
+                <option value="ALL" <%= visibilityMode === 'ALL' ? 'selected' : '' %>>所有人</option>
+                <option value="ADMIN" <%= visibilityMode === 'ADMIN' ? 'selected' : '' %>>仅管理员</option>
+                <option value="MEMBER" <%= visibilityMode === 'MEMBER' ? 'selected' : '' %>>指定成员</option>
+              </select>
+            </div>
+            <div class="form-group field-inline-sm col-sm-6<%= visibilityMode === 'MEMBER' ? '' : ' d-none' %>" id="ev-visible-to-field">
+              <label for="ev-visible-to">指定成员</label>
+              <select class="form-control" id="ev-visible-to" name="visibleTo">
+                <% memberOptions.forEach(m => { %>
+                  <option value="<%= m.email %>" <%= visibility === m.email ? 'selected' : '' %>><%= m.name %>（<%= m.email %>）</option>
+                <% }) %>
+              </select>
             </div>
           </div>
 
@@ -139,6 +175,18 @@
     var latInput = document.getElementById('ev-lat');
     var lngInput = document.getElementById('ev-lng');
     var radiusInput = document.getElementById('ev-radius');
+    var visibilityInput = document.getElementById('ev-visibility');
+    var visibleToInput = document.getElementById('ev-visible-to');
+    var visibleToField = document.getElementById('ev-visible-to-field');
+
+    // The member picker only exists as part of the 指定成员 answer, so it is shown
+    // and hidden with it. Called from `setMode` too: `form.reset()` puts the
+    // <select> back to its rendered option, and this row has to follow it.
+    function syncVisibility() {
+      visibleToField.classList.toggle('d-none', visibilityInput.value !== 'MEMBER');
+    }
+
+    visibilityInput.addEventListener('change', syncVisibility);
 
     // The datetimes the page was rendered with, i.e. what `form.reset()` puts back.
     var RENDERED_START = startInput.value;
@@ -221,6 +269,7 @@
       // Whatever the fields now hold is the baseline the auto-end is judged
       // against, so a reset never leaves the previous mode's start behind.
       lastStart = startInput.value;
+      syncVisibility();
       titleEl.textContent = mode.title;
       submit.textContent = mode.submit;
       submit.disabled = false;
@@ -541,6 +590,15 @@
       // Fixed-width and same format, so string order is time order — the same
       // comparison the server and the SQL CHECK make.
       if (body.endAt <= body.startAt) return fail('结束时间必须晚于开始时间');
+
+      // Two controls, one stored column: 指定成员 sends the chosen address, the
+      // other two send their own keyword.
+      if (visibilityInput.value === 'MEMBER') {
+        if (!visibleToInput.value) return fail('请选择可见的成员');
+        body.visibility = visibleToInput.value;
+      } else {
+        body.visibility = visibilityInput.value;
+      }
 
       // No point picked = an online event; the server stores coords as null and
       // the event page then hides the check-in card entirely.

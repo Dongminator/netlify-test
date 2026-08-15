@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS gsffc.user_photos (
 --
 -- `date`, `endDate` and `time` still exist as read-only derived fields on the
 -- app's event object (db.js `rowToEvent`), which is why the calendar kept working.
+-- `visibility` is who may see the event at all — not a rendering flag: an event
+-- the viewer cannot see is absent from the calendar and from /api/events, and
+-- its page 404s. Exactly three shapes, and the CHECK is what keeps it to them:
+--   'ALL'    — every signed-in member (the default, i.e. every existing row)
+--   'ADMIN'  — administrators only
+--   an email — that one member, and nobody else
+-- Administrators always see everything regardless, which is what stops an event
+-- from being created that nobody left can manage. The address is stored
+-- lowercase and carries no foreign key to `users`, for the same reason
+-- `event_signups.email` doesn't: the seeds may name members without accounts.
 CREATE TABLE IF NOT EXISTS gsffc.events (
   id          TEXT PRIMARY KEY,
   title       TEXT NOT NULL,
@@ -66,7 +76,9 @@ CREATE TABLE IF NOT EXISTS gsffc.events (
   description TEXT,
   capacity    INTEGER NOT NULL DEFAULT 0,
   checkin_radius INTEGER NOT NULL DEFAULT 10,
-  CONSTRAINT events_end_after_start CHECK (end_at > start_at)
+  visibility  TEXT NOT NULL DEFAULT 'ALL',
+  CONSTRAINT events_end_after_start CHECK (end_at > start_at),
+  CONSTRAINT events_visibility_shape CHECK (visibility IN ('ALL', 'ADMIN') OR visibility LIKE '%@%')
 );
 
 -- One row per member per event. `signed_up_at` is both the audit trail and the

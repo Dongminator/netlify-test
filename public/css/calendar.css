@@ -262,6 +262,20 @@
   font-weight: 500;
 }
 
+/* An event not everyone can see. The amber edge is the whole signal — the chip
+   keeps its size and its layout, since a restricted event is still an ordinary
+   one to the member looking at it. */
+.cal-event.is-restricted {
+  border-left-color: #d39e00;
+  background: #fff8e6;
+}
+
+.cal-event-lock {
+  margin-right: .25rem;
+  font-size: .625rem;
+  color: #b07d00;
+}
+
 .cal-event.is-past {
   border-left-color: var(--gsf-ink-faint);
   background: #f1f3f5;
