@@ -82,25 +82,15 @@
             </div>
           </div>
 
-          <%# The two headcounts, side by side because they are read together and
-              mean different things: 人数上限 is the number of app places the
-              waitlist is measured against, 总人数 is what actually turned up
-              including people who have no account here. 总人数 is deliberately
-              **optional** — an event that has not happened yet has no answer, and
-              a blank box stores NULL rather than 0. The .form-text hint is hidden
-              under sm by .field-inline-sm, so the placeholder repeats it. %>
-          <div class="form-row">
-            <div class="form-group field-inline-sm col-sm-6">
-              <label for="ev-capacity">人数上限</label>
-              <input class="form-control" id="ev-capacity" name="capacity" type="number" min="0" step="1" required
-                     value="<%= isEdit ? formEvent.capacity : 22 %>">
-            </div>
-            <div class="form-group field-inline-sm col-sm-6">
-              <label for="ev-headcount">总人数</label>
-              <input class="form-control" id="ev-headcount" name="totalHeadcount" type="number" min="0" step="1"
-                     placeholder="包含试训、guest，可留空" value="<%= val('totalHeadcount') %>">
-              <small class="form-text text-muted">包含试训、guest。留空表示未统计。</small>
-            </div>
+          <%# 人数上限 is the number of app places the waitlist is measured
+              against, and it is now the only headcount on this form: 总人数 —
+              typed in by hand and used to size 自动分队 — is gone, because the
+              team size is derived from 已报名人数 + 试训批准人数 instead. It takes
+              the full width now that nothing shares its row. %>
+          <div class="form-group field-inline-sm">
+            <label for="ev-capacity">人数上限</label>
+            <input class="form-control" id="ev-capacity" name="capacity" type="number" min="0" step="1" required
+                   value="<%= isEdit ? formEvent.capacity : 22 %>">
           </div>
 
           <%# 可见范围: who the event exists for at all. 指定成员 reveals the member
@@ -598,12 +588,7 @@
         endAt: f.end.value.slice(0, 16),
         location: f.location.value.trim(),
         description: f.description.value.trim(),
-        capacity: Number(f.capacity.value),
-        // Optional: an empty box is sent as null ("not recorded"), never as the
-        // 0 that Number('') would produce. The server applies the same rule.
-        totalHeadcount: f.totalHeadcount.value.trim() === ''
-          ? null
-          : Number(f.totalHeadcount.value)
+        capacity: Number(f.capacity.value)
       };
       if (!body.title) return fail('请填写活动名称');
       if (!DT_RE.test(body.startAt)) return fail('请选择开始日期和时间');
@@ -611,13 +596,6 @@
       // Fixed-width and same format, so string order is time order — the same
       // comparison the server and the SQL CHECK make.
       if (body.endAt <= body.startAt) return fail('结束时间必须晚于开始时间');
-      // null is the valid "not recorded" case and passes straight through; only a
-      // filled-in box is checked. The server repeats this — it is the authority.
-      if (body.totalHeadcount !== null
-        && (!isFinite(body.totalHeadcount) || body.totalHeadcount < 0
-          || Math.floor(body.totalHeadcount) !== body.totalHeadcount)) {
-        return fail('总人数必须为非负整数，或留空');
-      }
 
       // Two controls, one stored column: 指定成员 sends the chosen address, the
       // other two send their own keyword.

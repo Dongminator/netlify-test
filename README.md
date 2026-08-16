@@ -1,3 +1,8 @@
+TODO:
+- after event deleted, do not change URL with things like "delete=1"
+
+
+
 # app.gsf.test
 
 GSF俱乐部会员App的本地测试克隆，仿照 https://app.gsffc.org 的活动报名功能。

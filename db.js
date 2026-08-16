@@ -39,55 +39,91 @@ const WAITLIST = 'WAITLIST';
 // different count is a change to that function, not just to this constant.
 const TEAM_COUNT = 3;
 
-// Places per team: the event's headcount split three ways, rounded **up**, so 25
-// gives teams of 9 (9 + 9 + 7). Derived on every read and never stored, which is
-// what lets an admin correct an event's 总人数 and have its teams re-size with it.
+// Places per team: everybody who is coming, split three ways and rounded **up**,
+// so 25 gives teams of 9 (9 + 9 + 7).
 //
-// 总人数 is the number when it has been recorded, and 人数上限 (`capacity`) is the
-// fallback when it has not — an event always has one, so teams can be filled from
-// the first check-in without waiting for an admin to type the real headcount in.
-// The fallback is on **null only**: a recorded 0 is "nobody came", an answer, not
-// a blank, and it sizes no teams. null (nobody is allocated at all) is therefore
-// left for the event that has neither — no 总人数 and `capacity` 0, the column's
-// own default.
-function teamSize(totalHeadcount, capacity) {
-  const total = Number(totalHeadcount ?? capacity);
+// **Who is coming is 已报名人数 + 试训批准人数** — the event's confirmed signups
+// plus its approved 试训/Guest. It replaced the hand-typed `events.total_headcount`
+// (总人数), which an admin had to keep in agreement with the roster by hand and
+// which is now gone: the two numbers the club actually maintains already add up
+// to the answer. The waitlist is deliberately **not** in it — a waitlisted member
+// has no place at the event yet, so they are nobody's teammate until they are
+// promoted, at which point the size grows on its own.
+//
+// Derived on every read and never stored, like everything else about a team, so
+// the teams re-size as members sign up, withdraw or are promoted and as guests
+// are approved — the same way correcting `startAt` re-prices 迟到罚款. Nobody is
+// ever re-allocated by it: see `pickTeam`.
+//
+// null — nobody is allocated at all, which leaves `event_checkins.team_no` NULL —
+// is what an event with nobody on it at all answers, and nothing else: the first
+// signup makes it 1. `capacity` (人数上限) has no part in this any more; it caps
+// the roster, it does not size the teams.
+function teamSize(signedUp, approvedGuests = 0) {
+  const total = Number(signedUp) + Number(approvedGuests);
   if (!Number.isFinite(total) || total <= 0) return null;
   return Math.ceil(total / TEAM_COUNT);
 }
 
-// 自动分队 — the guests' names down the teams: A, B, C… Past Z a guest is
-// numbered instead; an event with 26 more bodies than places is well past
-// anything the club does.
-const GUEST_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+// 试训/Guest. The two kinds, stored uppercase in `event_guests.type` and
+// constrained by a CHECK in db/schema.sql, so these strings must stay in sync
+// with it. 试训 and Guest are the labels server.js renders them as — this layer
+// names them by keyword, the same arrangement as `users.role`.
+const GUEST_TRIAL = 'TRIAL';
+const GUEST_GUEST = 'GUEST';
+const GUEST_TYPES = [GUEST_TRIAL, GUEST_GUEST];
 
-// 自动分队 — the 试训/guest places. A trialist or a guest has no account, so they
-// can never sign up, never check in and are never on the roster: the only trace
-// of them is 总人数 counting bodies that 人数上限 does not. Their number is
-// therefore exactly that difference, and their teams are hardcoded rather than
-// drawn —
+// How many 试训/Guest an event can actually hold. Members may request as many as
+// they like; this caps the **approved** rows, and it is the reason every approval
+// runs under the event lock — counting and then writing is exactly what two
+// admins tapping 批准 at once would interleave. Not a constraint in
+// db/schema.sql, which cannot express "three rows per event".
+const MAX_EVENT_GUESTS = 3;
+
+// A submitted 试训/Guest type, coerced to one of the column's two keywords.
+// Throws rather than storing anything else — the CHECK in db/schema.sql would
+// refuse it as a 500 further down.
+function normalizeGuestType(value) {
+  const upper = String(value == null ? '' : value).trim().toUpperCase();
+  if (!GUEST_TYPES.includes(upper)) throw new Error('类型必须为试训或 Guest');
+  return upper;
+}
+
+// The guest's name is free text typed by a member and is rendered on the event
+// page, so it is trimmed, required, and capped at something a name can fit in.
+function normalizeGuestName(value) {
+  const name = String(value == null ? '' : value).trim();
+  if (!name) throw new Error('请填写试训/Guest 的姓名');
+  if (name.length > 40) throw new Error('姓名最多 40 个字');
+  return name;
+}
+
+// 自动分队 — where the 试训/guest places land. A trialist or a guest has no
+// account, so they can never sign up, never check in and are never on the
+// roster; `gsffc.event_guests` is the only record of them, and the **approved**
+// rows of it are what this places. Their number used to be *guessed*, as
+// 总人数 − 人数上限, and they were labelled A/B/C — the real rows replaced that
+// derivation, and nothing else about the rule moved. It is still hardcoded
+// rather than drawn:
 //
 //   1 guest  → the bench
 //   2 guests → the bench, plus the last place in one of the two playing teams
 //   3 guests → one each
 //
 // — with anything past three going onto the bench, which is already the overflow
-// for members. The difference only means something when the event has both
-// numbers: an event with no 人数上限 (`capacity` 0, the column's default) has no
-// member baseline to subtract from, so it has no guests either, and neither does
-// one whose 总人数 has not been recorded yet.
+// for members. `MAX_EVENT_GUESTS` keeps an event to three, so that last clause
+// is the safety net rather than the normal case it used to be.
 //
 // **A playing team that is already full takes no guest**: the place goes to the
 // bench instead. Only the bench is uncapped, so a guest hardcoded into 黑桃/红桃
-// would otherwise push it to `size + 1` — which is exactly what happens whenever
-// members were allocated before the guests existed, i.e. every event whose 总人数
-// is filled in or corrected upwards after people have started checking in
-// (`teamSize` then re-sizes the teams, but nobody is ever re-allocated). `taken`
-// is what makes that visible here: the number of **members** already holding a
-// place in each team, a Map of team → count, from the caller that has them —
-// `rowToEvent` from the roster, `pickTeam` from its own count query. It is
-// members only; the guest places this function is deciding are added on top of it
-// as they are placed, so two guests can never be given the same last place.
+// would otherwise push it to `size + 1` — which is what happens whenever members
+// were allocated before the guest was approved, i.e. every guest approved after
+// people have started checking in. `taken` is what makes that visible here: the
+// number of **members** already holding a place in each team, a Map of
+// team → count, from the caller that has them — `rowToEvent` from the roster,
+// `pickTeam` from its own count query. It is members only; the guest places this
+// function is deciding are added on top of it as they are placed, so two guests
+// can never be given the same last place.
 //
 // Derived on every read like everything else about a team, which is what rules
 // out drawing the second guest's playing team at random: a fresh draw would move
@@ -97,15 +133,12 @@ const GUEST_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 // bumped to the bench is not a fresh draw: it is decided from the same check-in
 // rows both callers read, so both agree, and it only ever moves one way.
 //
-// Returns `[{ label, team }]` ordered by team, so the labels read A, B, C down
-// the list. The label is all this layer names them: 试训Guest A is UI text.
-function eventGuests(eventId, totalHeadcount, capacity, taken = new Map()) {
-  const total = Number(totalHeadcount);
-  const cap = Number(capacity);
-  if (totalHeadcount == null || !Number.isFinite(total) || !(cap > 0)) return [];
-  const count = Math.max(0, total - cap);
-  if (!count) return [];
-  const size = teamSize(totalHeadcount, capacity);
+// `guests` is the approved rows in approval order (`rowToGuest` shape) and `size`
+// is the event's `teamSize`. Returns those same guests each with a `team`, sorted
+// by it — the order they are read down the team list.
+function eventGuests(eventId, guests = [], size = null, taken = new Map()) {
+  const list = Array.isArray(guests) ? guests : [];
+  if (!list.length) return [];
   const id = String(eventId || '');
   let sum = 0;
   for (let i = 0; i < id.length; i++) sum += id.charCodeAt(i);
@@ -119,13 +152,14 @@ function eventGuests(eventId, totalHeadcount, capacity, taken = new Map()) {
     const used = (taken.get(wanted) || 0) + (held.get(wanted) || 0);
     return size && used < size ? wanted : TEAM_COUNT;
   };
-  return Array.from({ length: count }, (_, i) => {
-    const team = place(order[i] != null ? order[i] : TEAM_COUNT);
-    held.set(team, (held.get(team) || 0) + 1);
-    return team;
-  })
-    .sort((a, b) => a - b)
-    .map((team, i) => ({ label: GUEST_LABELS[i] || String(i + 1), team }));
+  return list
+    .map((guest, i) => {
+      const team = place(order[i] != null ? order[i] : TEAM_COUNT);
+      held.set(team, (held.get(team) || 0) + 1);
+      return { ...guest, team };
+    })
+    // Stable, so guests sharing a team keep their approval order inside it.
+    .sort((a, b) => a.team - b.team);
 }
 
 // The two keyword values of `events.visibility`; anything else in that column is
@@ -153,7 +187,7 @@ const pool = new Pool({
 // test compares lexically against `todayStr()`, and `time` keeps the exact shape
 // the old free-text column had ('16:00 - 18:00'), which is why the calendar chip
 // and its tooltip needed no rewrite. Nothing writes through them.
-function rowToEvent(row, roster = []) {
+function rowToEvent(row, roster = [], guestRows = []) {
   if (!row) return null;
   const startAt = String(row.start_at || '');
   const endAt = String(row.end_at || '');
@@ -163,6 +197,12 @@ function rowToEvent(row, roster = []) {
   // playing team takes no guest — see `eventGuests`.
   const teams = Array.from({ length: TEAM_COUNT }, (_, i) =>
     roster.filter(s => s.team === i + 1).map(s => s.email));
+  // 试训/Guest — the approved rows are the ones that hold a place; the pending
+  // ones are requests waiting for an admin and count for nothing yet.
+  const approvedGuests = guestRows.filter(g => g.approvedAt);
+  // 已报名人数 + 试训批准人数 — see `teamSize`. Both halves are right here, so the
+  // size costs no query of its own.
+  const size = teamSize(roster.filter(s => s.status === SIGNED_UP).length, approvedGuests.length);
   return {
     id: row.id,
     title: row.title,
@@ -176,10 +216,6 @@ function rowToEvent(row, roster = []) {
     description: row.description,
     capacity: row.capacity,
     checkinRadius: row.checkin_radius != null ? row.checkin_radius : 10,
-    // 总人数（包含试训、guest）— recorded by hand, never derived from `roster`.
-    // NULL is "not recorded" and stays distinct from 0 ("nobody came"), so it is
-    // passed through as null rather than defaulted like `checkinRadius` above.
-    totalHeadcount: row.total_headcount != null ? row.total_headcount : null,
     // 'ALL', 'ADMIN', or the one member's email — see `canSeeEvent`. Rows
     // written before the column existed read as 'ALL', the open default.
     visibility: row.visibility || VISIBLE_ALL,
@@ -190,15 +226,37 @@ function rowToEvent(row, roster = []) {
     // 自动分队, both read-only views like the three arrays above: `teamSize` is
     // computed from 总人数, or from `capacity` until that is recorded, and `teams`
     // is the roster grouped by team (built above).
-    teamSize: teamSize(row.total_headcount, row.capacity),
+    teamSize: size,
     teams,
-    // The 试训/guest places, `[{ label, team }]` — see `eventGuests`, which is
-    // given how many members each team already holds so a full 黑桃/红桃 hands its
-    // guest to the bench instead of overflowing. They are not in `teams` above and
-    // never will be: that is the roster grouped by team, and a guest has no
-    // account and so no email to appear in it.
-    guests: eventGuests(row.id, row.total_headcount, row.capacity,
+    // 试训/Guest, all three read-only views over `guestRows` — every request this
+    // event has, the approved ones, and the approved ones placed into teams by
+    // `eventGuests` (which is given how many members each team already holds, so a
+    // full 黑桃/红桃 hands its guest to the bench instead of overflowing).
+    // The placed guests are not in `teams` above and never will be: that is the
+    // roster grouped by team, and a guest has no account and so no email in it.
+    guestRequests: guestRows,
+    approvedGuests,
+    guests: eventGuests(row.id, approvedGuests, size,
       new Map(teams.map((members, i) => [i + 1, members.length])))
+  };
+}
+
+// One 试训/Guest row. `approvedAt` being non-null is the whole difference between
+// a pending request and a place at the event, so everything downstream tests it
+// rather than a separate status column.
+function rowToGuest(row) {
+  if (!row) return null;
+  return {
+    // BIGSERIAL comes back from pg as a string to protect precision it will never
+    // need here; a number is what the routes and the templates want.
+    id: Number(row.id),
+    type: row.type,
+    name: row.name,
+    requestedBy: row.requested_by,
+    requestedAt: row.requested_at,
+    // Both NULL together — a CHECK in db/schema.sql holds the pair.
+    approvedBy: row.approved_by || null,
+    approvedAt: row.approved_at || null
   };
 }
 
@@ -459,6 +517,17 @@ async function deleteUser(email) {
       await client.query(
         `DELETE FROM ${SCHEMA}.event_checkins WHERE email = $1`, [normalized]
       );
+      // 试训/Guest: the member's **pending** requests only. Nobody could cancel
+      // them once the account is gone, and they would sit in every admin's review
+      // dialog for good. An *approved* one is deliberately left: the club is
+      // expecting that body, the teams are already sized around them, and the
+      // address stays on the row exactly as `checked_in_by` keeps a deleted
+      // admin's.
+      await client.query(
+        `DELETE FROM ${SCHEMA}.event_guests
+         WHERE requested_by = $1 AND approved_at IS NULL`,
+        [normalized]
+      );
       const { rows: gone } = await client.query(
         `DELETE FROM ${SCHEMA}.event_signups WHERE email = $1
          RETURNING event_id, status`,
@@ -522,12 +591,34 @@ async function getRosters(ids, client = pool) {
   return byEvent;
 }
 
+// 试训/Guest for a set of events, as a Map of event id -> guest array. Approved
+// rows come first and the pending requests after, each half oldest-decision
+// first: the approved half in that order is exactly the order the guest places
+// are handed out down the teams (`eventGuests`), and the pending half is the
+// queue an admin reviews. (`false` sorts before `true` in Postgres, so the
+// CASE-free boolean works — same shape as `getRosters`.)
+async function getEventGuests(ids, client = pool) {
+  const byEvent = new Map(ids.map(id => [id, []]));
+  if (!ids.length) return byEvent;
+  const { rows } = await client.query(
+    `SELECT * FROM ${SCHEMA}.event_guests
+     WHERE event_id = ANY($1)
+     ORDER BY (approved_at IS NULL), approved_at, requested_at, id`,
+    [ids]
+  );
+  for (const row of rows) byEvent.get(row.event_id).push(rowToGuest(row));
+  return byEvent;
+}
+
 async function getEvents() {
   const { rows } = await pool.query(
     `SELECT * FROM ${SCHEMA}.events ORDER BY start_at`
   );
-  const rosters = await getRosters(rows.map(r => r.id));
-  return rows.map(row => rowToEvent(row, rosters.get(row.id)));
+  const ids = rows.map(r => r.id);
+  // Two independent reads over the same set of ids — one round trip apiece, and
+  // in parallel, so a page of events still costs a constant number of them.
+  const [rosters, guests] = await Promise.all([getRosters(ids), getEventGuests(ids)]);
+  return rows.map(row => rowToEvent(row, rosters.get(row.id), guests.get(row.id)));
 }
 
 async function getEvent(id) {
@@ -535,8 +626,11 @@ async function getEvent(id) {
     `SELECT * FROM ${SCHEMA}.events WHERE id = $1`, [id]
   );
   if (!rows[0]) return null;
-  const rosters = await getRosters([rows[0].id]);
-  return rowToEvent(rows[0], rosters.get(rows[0].id));
+  const [rosters, guests] = await Promise.all([
+    getRosters([rows[0].id]),
+    getEventGuests([rows[0].id])
+  ]);
+  return rowToEvent(rows[0], rosters.get(rows[0].id), guests.get(rows[0].id));
 }
 
 // Every roster write runs in here: a transaction holding a row lock on the event
@@ -661,6 +755,9 @@ async function withdrawFromEvent(eventId, email) {
 }
 
 // Admin "清空报名": drop the whole roster, waitlist and check-ins included.
+// Deliberately leaves `event_guests` alone — a 试训/Guest is not a member's
+// signup, and an approved one is a body the club is still expecting. Removing
+// them is the review dialog's 移出, one at a time.
 async function clearEventRoster(eventId) {
   return withEventLock(eventId, async (client) => {
     await client.query(`DELETE FROM ${SCHEMA}.event_checkins WHERE event_id = $1`, [eventId]);
@@ -671,31 +768,211 @@ async function clearEventRoster(eventId) {
   });
 }
 
+// How many 试训/Guest this event has already approved. The count and the write
+// that follows it are what the event lock is held for, so every caller below is
+// inside `withEventLock`.
+async function countApprovedGuests(client, eventId) {
+  const { rows } = await client.query(
+    `SELECT COUNT(*)::int AS approved FROM ${SCHEMA}.event_guests
+     WHERE event_id = $1 AND approved_at IS NOT NULL`,
+    [eventId]
+  );
+  return rows[0].approved;
+}
+
+// 申请试训/Guest — a member asking for a place for somebody with no account.
+// The row starts pending, which is what leaves it out of `event.approvedGuests`
+// and out of the teams.
+//
+// **One per member per event**, counting the pending and the approved alike:
+// there are only MAX_EVENT_GUESTS places, so one member queueing several would
+// crowd the rest of the club out of a queue that is reviewed by hand. It is not
+// a lifetime limit — cancelling a pending request frees the member's slot again,
+// and 移出 hands an approved one back to them still holding it. Counted under the
+// event lock for the same reason the approval cap is: count-then-write is exactly
+// what a double submit interleaves.
+//
+// It applies to `requestEventGuest` **only** — an admin's 添加 (`addEventGuest`)
+// records the admin as `requested_by` and is bounded by MAX_EVENT_GUESTS instead,
+// so an admin adding all three guests themselves is not blocked by this.
+// Returns { ok, reason, guest } — or null when there is no such event.
+async function requestEventGuest(eventId, { type, name, requestedBy }) {
+  const by = String(requestedBy || '').trim().toLowerCase();
+  if (!by) throw new Error('requestedBy 不能为空');
+  const guestType = normalizeGuestType(type);
+  const guestName = normalizeGuestName(name);
+  return withEventLock(eventId, async (client) => {
+    const { rows: mine } = await client.query(
+      `SELECT * FROM ${SCHEMA}.event_guests WHERE event_id = $1 AND requested_by = $2`,
+      [eventId, by]
+    );
+    if (mine[0]) return { ok: false, reason: 'alreadyRequested', guest: rowToGuest(mine[0]) };
+    const { rows } = await client.query(
+      `INSERT INTO ${SCHEMA}.event_guests (event_id, type, name, requested_by)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [eventId, guestType, guestName, by]
+    );
+    return { ok: true, reason: null, guest: rowToGuest(rows[0]) };
+  });
+}
+
+// 取消试训/Guest 申请 — a member taking their own request back. Three things can
+// refuse it, and they are distinct because the page says different things about
+// them: there is no such row, it is not this member's, or it has already been
+// approved. **An approved place is no longer the member's to cancel** — the club
+// is expecting that body and the teams are sized around it; only an admin can
+// send it back to pending (`unapproveEventGuest`). Same shape as a checked-in
+// member no longer being able to 取消报名.
+// Returns { removed, reason, guest } — or null when there is no such event.
+async function cancelEventGuest(eventId, guestId, email) {
+  const normalized = String(email || '').trim().toLowerCase();
+  return withEventLock(eventId, async (client) => {
+    const { rows } = await client.query(
+      `SELECT * FROM ${SCHEMA}.event_guests WHERE id = $1 AND event_id = $2`,
+      [guestId, eventId]
+    );
+    const guest = rows[0];
+    if (!guest) return { removed: false, reason: 'missing', guest: null };
+    if (guest.requested_by !== normalized) {
+      return { removed: false, reason: 'notYours', guest: null };
+    }
+    if (guest.approved_at) {
+      return { removed: false, reason: 'approved', guest: rowToGuest(guest) };
+    }
+    await client.query(`DELETE FROM ${SCHEMA}.event_guests WHERE id = $1`, [guestId]);
+    return { removed: true, reason: null, guest: rowToGuest(guest) };
+  });
+}
+
+// Admin 批准: a pending request becomes one of the event's places. The count and
+// the update are one transaction under the event lock, so two admins approving at
+// the same moment can never take the event past MAX_EVENT_GUESTS. Approving an
+// already-approved row is idempotent rather than an error — the dialog can be
+// double-tapped — and keeps the first approval's who and when.
+// Returns { ok, reason, guest, approved } — or null when there is no such event.
+async function approveEventGuest(eventId, guestId, adminEmail) {
+  const by = String(adminEmail || '').trim().toLowerCase();
+  return withEventLock(eventId, async (client) => {
+    const { rows } = await client.query(
+      `SELECT * FROM ${SCHEMA}.event_guests WHERE id = $1 AND event_id = $2`,
+      [guestId, eventId]
+    );
+    const guest = rows[0];
+    if (!guest) return { ok: false, reason: 'missing', guest: null };
+    if (guest.approved_at) return { ok: true, reason: null, guest: rowToGuest(guest) };
+    const approved = await countApprovedGuests(client, eventId);
+    if (approved >= MAX_EVENT_GUESTS) {
+      return { ok: false, reason: 'full', guest: rowToGuest(guest), approved };
+    }
+    const { rows: done } = await client.query(
+      `UPDATE ${SCHEMA}.event_guests SET approved_by = $3, approved_at = now()
+       WHERE id = $1 AND event_id = $2 RETURNING *`,
+      [guestId, eventId, by]
+    );
+    return { ok: true, reason: null, guest: rowToGuest(done[0]) };
+  });
+}
+
+// Admin 移出: an approved place goes **back to the pending list** rather than
+// being deleted. The request itself was the member's and is still theirs — so
+// undoing the approval hands it back to them, cancellable again, instead of
+// destroying it behind their back. It frees one of the MAX_EVENT_GUESTS places.
+// Already-pending is idempotent, for the same reason approving twice is.
+// Returns { ok, reason, guest } — or null when there is no such event.
+async function unapproveEventGuest(eventId, guestId) {
+  return withEventLock(eventId, async (client) => {
+    const { rows } = await client.query(
+      `SELECT * FROM ${SCHEMA}.event_guests WHERE id = $1 AND event_id = $2`,
+      [guestId, eventId]
+    );
+    const guest = rows[0];
+    if (!guest) return { ok: false, reason: 'missing', guest: null };
+    if (!guest.approved_at) return { ok: true, reason: null, guest: rowToGuest(guest) };
+    const { rows: done } = await client.query(
+      `UPDATE ${SCHEMA}.event_guests SET approved_by = NULL, approved_at = NULL
+       WHERE id = $1 AND event_id = $2 RETURNING *`,
+      [guestId, eventId]
+    );
+    return { ok: true, reason: null, guest: rowToGuest(done[0]) };
+  });
+}
+
+// Admin 添加试训/Guest — the direct path, with no request behind it: the row is
+// inserted already approved, so the admin is always `approved_by`. It is the same
+// place an approval creates and counts against the same MAX_EVENT_GUESTS, which
+// is why it takes the same lock.
+//
+// `requestedBy` is **who the guest is coming through** — a guest an admin adds is
+// usually still somebody's, and the club needs to know whose, so the dialog asks
+// for it and defaults to the admin. It only ever names the member; the admin
+// stays the approver, so 添加 remains an approval with no request behind it.
+// The one-request-per-member rule is deliberately **not** applied to it (it is
+// `requestEventGuest`'s alone — see there): an admin adding places is bounded by
+// MAX_EVENT_GUESTS instead, and refusing them because the member already has a
+// pending row would block the very thing they are doing about it.
+// Returns { ok, reason, guest, approved } — or null when there is no such event.
+async function addEventGuest(eventId, { type, name, by, requestedBy }) {
+  const admin = String(by || '').trim().toLowerCase();
+  if (!admin) throw new Error('by 不能为空');
+  // Empty means the admin themselves, which is what the field defaults to.
+  const requester = String(requestedBy || '').trim().toLowerCase() || admin;
+  const guestType = normalizeGuestType(type);
+  const guestName = normalizeGuestName(name);
+  return withEventLock(eventId, async (client) => {
+    const approved = await countApprovedGuests(client, eventId);
+    if (approved >= MAX_EVENT_GUESTS) {
+      return { ok: false, reason: 'full', guest: null, approved };
+    }
+    const { rows } = await client.query(
+      `INSERT INTO ${SCHEMA}.event_guests
+         (event_id, type, name, requested_by, approved_by, approved_at)
+       VALUES ($1, $2, $3, $4, $5, now()) RETURNING *`,
+      [eventId, guestType, guestName, requester, admin]
+    );
+    return { ok: true, reason: null, guest: rowToGuest(rows[0]) };
+  });
+}
+
 // 自动分队 — the team an arriving member joins, which is the club's rule exactly:
 // teams 1 and 2 are filled first (a random one of the two while both have room,
 // the one that still has room once the other is full), and once neither does,
 // everybody else goes into the last team. That last one is therefore the
-// overflow and is deliberately **uncapped**: 总人数 counts trialists and guests
-// who never check in, so the app's check-ins can outrun the number the teams
-// were sized from, and a member arriving must always land somewhere.
+// overflow and is deliberately **uncapped**: the size counts approved 试训/Guest
+// who never check in, and members can withdraw after arriving to shrink it, so
+// the app's check-ins can outrun the number the teams were sized from — and a
+// member arriving must always land somewhere.
 //
 // The 试训/guest places are **already taken**: a trialist can never check in, so
 // nothing else would ever hold the place back for them and the last member to
 // arrive would take it. Counting them here is what makes "2 guests → 板凳组一个，
 // 红桃/黑桃最后一个checkin名额给另一个guest" true of the arrivals as well as of
-// the display. They are derived here rather than passed in, because which team a
-// guest lands in now depends on the very counts this function queries — a full
-// playing team hands its guest to the bench (see `eventGuests`), and the page
-// must not be shown a team the arrivals disagree with.
+// the display. The approved rows are read here rather than passed in, because
+// which team a guest lands in depends on the very counts this function queries —
+// a full playing team hands its guest to the bench (see `eventGuests`), and the
+// page must not be shown a team the arrivals disagree with. The read is inside
+// the lock with everything else, so an approval landing mid-check-in is
+// serialised against it rather than being counted twice or not at all.
 //
-// Takes the event row the lock handed over, since the size and the guests both
-// come out of 总人数/人数上限. Returns null when there is no size to fill against —
-// see `teamSize`, i.e. an event with neither number — which is what leaves
-// `team_no` NULL and allocates nobody. The caller must hold the event lock from
-// `withEventLock`: this counts the rows and then writes one, so without it two
-// members checking in at the same moment could both take the last place in a team.
-async function pickTeam(client, eventId, event) {
-  const size = teamSize(event.total_headcount, event.capacity);
+// The size is derived here rather than taken off the event row: it is
+// 已报名人数 + 试训批准人数 now, so both halves are rows this function has to read
+// under the lock anyway. Returns null when there is nobody at the event at all —
+// see `teamSize` — which is what leaves `team_no` NULL and allocates nobody. The
+// caller must hold the event lock from `withEventLock`: this counts the rows and
+// then writes one, so without it two members checking in at the same moment could
+// both take the last place in a team.
+async function pickTeam(client, eventId) {
+  const { rows: approved } = await client.query(
+    `SELECT * FROM ${SCHEMA}.event_guests
+     WHERE event_id = $1 AND approved_at IS NOT NULL
+     ORDER BY approved_at, id`,
+    [eventId]
+  );
+  const { rows: [{ confirmed }] } = await client.query(
+    `SELECT COUNT(*)::int AS confirmed FROM ${SCHEMA}.event_signups
+     WHERE event_id = $1 AND status = '${SIGNED_UP}'`,
+    [eventId]
+  );
+  const size = teamSize(confirmed, approved.length);
   if (!size) return null;
   const { rows } = await client.query(
     `SELECT team_no, COUNT(*)::int AS taken FROM ${SCHEMA}.event_checkins
@@ -705,7 +982,7 @@ async function pickTeam(client, eventId, event) {
   );
   // Members only, which is what `eventGuests` needs; the guest places go on top.
   const taken = new Map(rows.map(r => [r.team_no, r.taken]));
-  const guests = eventGuests(eventId, event.total_headcount, event.capacity, taken);
+  const guests = eventGuests(eventId, approved.map(rowToGuest), size, taken);
   for (const g of guests) taken.set(g.team, (taken.get(g.team) || 0) + 1);
   const hasRoom = team => (taken.get(team) || 0) < size;
   if (hasRoom(1) && hasRoom(2)) return crypto.randomInt(2) + 1;
@@ -725,15 +1002,17 @@ async function pickTeam(client, eventId, event) {
 // This runs inside `withEventLock`, unlike the plain INSERT it used to be: 自动分队
 // is decided here, and picking a team means counting the teams first — a
 // read-then-write that two simultaneous arrivals would otherwise interleave.
-// The lock also hands over the event row, which is where the team size comes from.
+// The lock is also what makes the size `pickTeam` derives (the signups and the
+// approved guests) a consistent snapshot rather than one a concurrent signup or
+// approval could have moved under it.
 // Returns { checkedInAt, team, created } — `created` false when the member was
 // already checked in, carrying that first row's time and team — or null when
 // there is no such event.
 async function checkInToEvent(eventId, email, { lat, lng, distance, by } = {}) {
   const normalized = String(email || '').trim().toLowerCase();
   const proxy = String(by || '').trim().toLowerCase();
-  return withEventLock(eventId, async (client, event) => {
-    const team = await pickTeam(client, eventId, event);
+  return withEventLock(eventId, async (client) => {
+    const team = await pickTeam(client, eventId);
     const { rows } = await client.query(
       `INSERT INTO ${SCHEMA}.event_checkins
          (event_id, email, lat, lng, distance_m, checked_in_by, team_no)
@@ -774,8 +1053,8 @@ async function createEvent(event) {
   const { rows } = await pool.query(
     `INSERT INTO ${SCHEMA}.events
        (id, title, start_at, end_at, location, lat, lng, description, capacity, checkin_radius,
-        total_headcount, visibility)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        visibility)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      RETURNING *`,
     [
       crypto.randomBytes(12).toString('hex'),
@@ -788,8 +1067,6 @@ async function createEvent(event) {
       event.description,
       event.capacity,
       event.checkinRadius || 10,
-      // `?? null` and not `|| null`: 0 is a legitimate recorded headcount.
-      event.totalHeadcount ?? null,
       normalizeVisibility(event.visibility)
     ]
   );
@@ -809,7 +1086,7 @@ async function updateEvent(event) {
       `UPDATE ${SCHEMA}.events SET
          title = $2, start_at = $3, end_at = $4, location = $5,
          lat = $6, lng = $7, description = $8, capacity = $9, checkin_radius = $10,
-         total_headcount = $11, visibility = $12
+         visibility = $11
        WHERE id = $1`,
       [
         event.id,
@@ -822,7 +1099,6 @@ async function updateEvent(event) {
         event.description,
         event.capacity,
         event.checkinRadius || 10,
-        event.totalHeadcount ?? null,
         normalizeVisibility(event.visibility)
       ]
     );
@@ -846,9 +1122,11 @@ async function deleteEvent(id) {
 
 module.exports = {
   pool, ROLES, MEMBER, ADMIN, SIGNED_UP, WAITLIST, TEAM_COUNT, teamSize, eventGuests,
+  GUEST_TRIAL, GUEST_GUEST, GUEST_TYPES, MAX_EVENT_GUESTS,
   VISIBLE_ALL, VISIBLE_ADMIN, normalizeVisibility, canSeeEvent,
   getUsers, getUserByEmail, verifyPassword, createUser, upsertUser, updateUser, deleteUser,
   setUserPhoto, getUserPhoto,
   getEvents, getEvent, createEvent, updateEvent, deleteEvent,
-  signUpForEvent, withdrawFromEvent, clearEventRoster, checkInToEvent
+  signUpForEvent, withdrawFromEvent, clearEventRoster, checkInToEvent,
+  requestEventGuest, cancelEventGuest, approveEventGuest, unapproveEventGuest, addEventGuest
 };

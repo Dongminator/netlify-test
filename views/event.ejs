@@ -7,6 +7,15 @@
     re-reads the role and re-applies every gate. %>
 <% const proxyTargets = isAdmin && !isPast && event.coords
      ? participants.filter(p => !p.checkedIn) : []; %>
+<%# …and only once the check-in window is actually open. 代签到 is something an
+    admin does *standing at the pitch*, so before the window opens it is not a
+    thing they could be doing at all, and the button offered nothing but a dialog
+    saying 签到尚未开放. The window can open while the page sits there, so this is
+    the state at load only — a `setTimeout` in the block's own script reveals the
+    row at OPENS_AT rather than making the admin reload. That is also why the
+    dialog keeps its own 签到尚未开放 branch: it is what the second or so between
+    the reveal and the server's own clock is measured against. %>
+<% const proxyOpenAtLoad = serverNow >= checkinOpensAt; %>
 <%# Start and end are stored as 'YYYY-MM-DDTHH:MM', so both halves are slices:
     the date is rendered m/dd/yy (the club's display format everywhere) and the
     clock is taken as-is. The end repeats its date only when the event runs past
@@ -58,6 +67,27 @@
   <div class="alert alert-warning" role="alert">
     活动名额已满，你已加入<strong>候补名单</strong><% if (myPlace) { %>（第 <%= myPlace %> 位）<% } %>。
     有人取消报名时会按报名先后自动补位。
+  </div>
+<% } %>
+
+<% if (guestNote === 'requested') { %>
+  <%# Raised by the ?guest=requested redirect from POST /event/:id/guests. The
+      request is in, but it is not a place yet — saying so here is what stops a
+      member from telling their guest to turn up on the strength of it. %>
+  <div class="alert alert-info" role="alert">
+    已提交<strong>试训/Guest 申请</strong>，等待管理员批准。批准前可以自行取消。
+  </div>
+<% } else if (guestNote === 'invalid') { %>
+  <div class="alert alert-danger" role="alert">
+    试训/Guest 申请提交失败：请填写姓名（最多 40 字）并选择类型。
+  </div>
+<% } else if (guestNote === 'duplicate') { %>
+  <%# One request per member per event. The button is gone once they have one, so
+      this is a double submit — it says so rather than looking like nothing
+      happened, since the member did ask for something. %>
+  <div class="alert alert-warning" role="alert">
+    每人每场活动<strong>限申请 1 位</strong>试训/Guest。你在本次活动已有申请，
+    可以在下方「我提交的申请」中取消后再重新提交。
   </div>
 <% } %>
 
@@ -192,16 +222,12 @@
          + (p.checkedInBy ? '\n代签到：' + p.checkedInBy : '')
          + (p.fine ? '\n罚款：$' + p.fine + '（' + (p.lateLabel || '未签到') + '）' : ''); %>
     <div class="roster-block mb-4">
-      <%# Two counts, and they answer different questions: the first is who took a
-          place in the app, the second is who actually turned up — trialists and
-          guests included — which an admin records by hand. It is optional, so it
-          shows only once recorded — null means "not recorded" and the line is
-          simply absent, for an admin too. %>
+      <%# 已报名人数 against 人数上限. The hand-recorded 总人数 that used to sit
+          beside it is gone: the number that matters is now derived — it is this
+          count plus 试训批准人数 in the block below, which is what sizes 自动分队 —
+          so a third line would only have restated the two the page already shows. %>
       <div class="roster-head">
         <span class="roster-count">已报名人数：<%= participants.length %> / <%= event.capacity %></span>
-        <% if (event.totalHeadcount !== null) { %>
-          <span class="roster-count">总人数（包含试训、guest）：<strong><%= event.totalHeadcount %></strong></span>
-        <% } %>
       </div>
       <% if (participants.length === 0) { %>
         <p class="text-muted mb-0">还没有人报名</p>
@@ -283,6 +309,65 @@
         <p class="roster-legend mb-0">数字为候补顺序，有人取消报名时按此顺序自动补位。</p>
       </div>
     <% } %>
+
+    <%# 试训/Guest — who else is coming who has no account. **Both lists are public**
+        and sit right under the count: 已批准 is who is actually playing (the same
+        class of fact as the roster above), and 待批准 is the queue behind them,
+        which a member deciding whether to ask for a place needs to see. The head
+        carries the count against the cap, so 名额已满 is visible without opening
+        a dialog.
+        The viewer's own rows are the only ones that differ, and only by carrying
+        a 取消 on the pending ones — there is no separate "我提交的申请" block any
+        more, since a public queue already shows them their own request. An
+        approved one is deliberately **not** cancellable: the club is expecting
+        that body and the teams are sized around them, so only an admin can move
+        it (the same shape as a checked-in member no longer being able to 取消报名).
+        Rendered **only when there is something in it** — the same test the
+        waitlist above uses. An event with no 试训/Guest at all is the ordinary
+        case, and a heading over two empty lists says nothing the 已批准 0 / 3 note
+        in the action stack does not already say. %>
+    <% if (approvedGuests.length || pendingGuests.length) { %>
+    <div class="roster-block guest-block mb-4">
+      <div class="roster-head">试训/Guest：<%= approvedGuests.length %> / <%= maxGuests %></div>
+      <%# One row shape for both lists, so 已批准 and 待批准 read as one column.
+          The row carries **no** 已批准/待批准 of its own: the heading above it
+          already says which list this is, and repeating it on every row cost a
+          third of the width in a ~300px sidebar for nothing. 取消 rides on the row
+          it belongs to rather than in a list of its own. %>
+      <% const guestRow = g => { %>
+        <li class="guest-item">
+          <span class="guest-name"><%= g.name %></span>
+          <span class="guest-type"><%= g.typeLabel %></span>
+          <span class="guest-meta">由 <%= g.requestedByName %> 提交</span>
+          <% if (g.isMine && !g.approved && !isPast) { %>
+            <form class="guest-cancel" method="POST"
+                  action="/event/<%= event.id %>/guests/<%= g.id %>/cancel"
+                  onsubmit="return confirm('确定取消「<%= g.name %>」的试训/Guest 申请吗？');">
+              <button class="guest-cancel-btn" type="submit">取消</button>
+            </form>
+          <% } %>
+        </li>
+      <% }; %>
+
+      <% if (approvedGuests.length) { %>
+        <div class="guest-section-sm">
+          <div class="guest-sub-head is-approved">已批准</div>
+          <ul class="guest-list">
+            <% approvedGuests.forEach(guestRow) %>
+          </ul>
+        </div>
+      <% } %>
+
+      <% if (pendingGuests.length) { %>
+        <div class="guest-section-sm">
+          <div class="guest-sub-head">待批准<span class="guest-sub-count">（<%= pendingGuests.length %>）</span></div>
+          <ul class="guest-list">
+            <% pendingGuests.forEach(guestRow) %>
+          </ul>
+        </div>
+      <% } %>
+    </div>
+    <% } %>
   </div>
 </div>
 
@@ -330,6 +415,31 @@
         </form>
       </div>
     <% } %>
+
+    <%# 申请试训/Guest — the **member's** entry point, open to anyone who can see
+        the event whether or not they signed up themselves: bringing somebody is a
+        separate thing from playing. An admin does not see it at all — they do not
+        queue for their own approval, so 添加 in the review dialog is their way in
+        and this row is skipped for them entirely (the 审核/添加 row below carries
+        the same count).
+        `canRequestGuest` is the route's decision, not this template's; when it is
+        false the row keeps its note and loses only the button, so the member is
+        told *why* rather than left looking for something that vanished — the same
+        shape as 取消报名 disappearing after a check-in. The note always states how
+        many places are left, so nobody submits into a full event without knowing. %>
+    <% if (!isAdmin) { %>
+      <div class="event-action">
+        <% if (canRequestGuest) { %>
+          <button class="btn btn-outline-secondary btn-action" type="button"
+                  data-toggle="modal" data-target="#guest-request-modal">
+            <i class="fas fa-user-plus mr-1" aria-hidden="true"></i>申请试训/Guest
+          </button>
+        <% } %>
+        <span class="event-action-note text-muted">
+          试训/Guest 已批准 <%= approvedGuests.length %> / <%= maxGuests %> 位<% if (approvedGuests.length >= maxGuests) { %>，名额已满<% } %><% if (guestRequestClosedNote) { %>　·　<%= guestRequestClosedNote %><% } %>
+        </span>
+      </div>
+    <% } %>
   <% } %>
 
   <% if (isAdmin) { %>
@@ -339,18 +449,37 @@
         stays: copying a past event onto next week is the normal way the next one
         is made, and it writes a *new* event rather than touching this one. %>
     <%# 代签到 comes first of the admin actions: it is the one that belongs to the
-        event as it happens, rather than to managing the record of it. It is
-        offered whatever the check-in window says — the dialog is where the
-        reason lives, so an admin never taps a button that silently does
-        nothing — but disappears once everybody has arrived. %>
+        event as it happens, rather than to managing the record of it. It appears
+        **only once the check-in window is open** — it is done standing at the
+        pitch, so before then there is nothing an admin could be doing with it —
+        and disappears again once everybody has arrived. `d-none` rather than
+        absent when the window has not opened yet: the row is already in the DOM
+        so the block's own script can reveal it at that instant, without a reload. %>
     <% if (proxyTargets.length) { %>
-      <div class="event-action">
+      <div class="event-action<%= proxyOpenAtLoad ? '' : ' d-none' %>" id="proxy-action">
         <button class="btn btn-brand btn-action" type="button"
                 data-toggle="modal" data-target="#proxy-checkin-modal">
           <i class="fas fa-user-check mr-1" aria-hidden="true"></i>代签到
         </button>
         <span class="event-action-note text-muted">
           还有 <%= proxyTargets.length %> 人未签到
+        </span>
+      </div>
+    <% } %>
+
+    <% if (!isPast) { %>
+      <%# 审核/添加 试训/Guest — approve or remove the event's guest places, and add
+          one directly, which is the admin's *only* way in: they get no 申请 button.
+          The label names both halves for that reason. It belongs with 代签到 rather
+          than with the record-management buttons below: both are about the event as
+          it is happening. Frozen with the rest once the event has ended. %>
+      <div class="event-action">
+        <button class="btn btn-brand btn-action" type="button"
+                data-toggle="modal" data-target="#guest-review-modal">
+          <i class="fas fa-user-friends mr-1" aria-hidden="true"></i>审核/添加 试训/Guest
+        </button>
+        <span class="event-action-note text-muted">
+          已批准 <%= approvedGuests.length %> / <%= maxGuests %><% if (pendingGuests.length) { %> · 待批准 <%= pendingGuests.length %><% } %>
         </span>
       </div>
     <% } %>
@@ -395,6 +524,54 @@
   <% } %>
 </div>
 
+<%# 申请试训/Guest. A plain form POST — one shot, and the page behind it changes —
+    so this dialog needs no script at all: submitting navigates, and the redirect
+    raises the banner at the top. The two fields are all there is to say about a
+    guest; who asked and when are the server's to record.
+    Rendered on exactly the test that renders the button that opens it. %>
+<% if (canRequestGuest) { %>
+  <div class="modal fade" id="guest-request-modal" tabindex="-1" role="dialog"
+       aria-labelledby="guest-request-title" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered" role="document">
+      <div class="modal-content">
+        <form method="POST" action="/event/<%= event.id %>/guests">
+          <div class="modal-header">
+            <h5 class="modal-title" id="guest-request-title">申请试训/Guest</h5>
+            <button class="close" type="button" data-dismiss="modal" aria-label="关闭">
+              <span aria-hidden="true">&times;</span>
+            </button>
+          </div>
+          <div class="modal-body">
+            <p class="guest-note">
+              为没有账号的试训球员或朋友申请名额。提交后需要<strong>管理员批准</strong>才算成功，
+              每场活动最多 <%= maxGuests %> 位（当前已批准 <%= approvedGuests.length %> 位），
+              <strong>每人限申请 1 位</strong>，签到开放后不能再申请。
+              批准前你可以自行取消，批准后请联系管理员。
+            </p>
+            <div class="form-group field-inline-sm">
+              <label for="guest-type">类型</label>
+              <select class="form-control" id="guest-type" name="type">
+                <% guestTypes.forEach(t => { %>
+                  <option value="<%= t.value %>"><%= t.label %></option>
+                <% }) %>
+              </select>
+            </div>
+            <div class="form-group field-inline-sm mb-0">
+              <label for="guest-name">姓名</label>
+              <input class="form-control" id="guest-name" name="name" type="text"
+                     maxlength="40" required placeholder="试训/Guest 的姓名">
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-secondary" type="button" data-dismiss="modal">取消</button>
+            <button class="btn btn-brand" type="submit">提交申请</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+<% } %>
+
 <% if (isAdmin) { %>
   <%# Still included on a finished event: 复制 opens it in `copy` mode, which POSTs
       a new event. Nothing opens it in `edit` mode there, since that button is gone. %>
@@ -429,6 +606,288 @@
       </div>
     </div>
   </div>
+<% } %>
+
+<%# 审核/添加 试训/Guest. Three actions on one list — 批准 a pending request, 移出 an
+    approved place, and 添加 one outright — so every one of them changes both
+    halves of the dialog and how many places are left. Rather than moving a row
+    across by hand, each action answers with the event's **whole** refreshed guest
+    payload and the dialog redraws from it: one renderer, `render()`, exactly like
+    the check-in button and the 代签到 status line.
+
+    That is also why both lists are built in script from `data-guests` rather than
+    rendered as EJS and then patched — two renderers of the same list is how they
+    come to disagree. Nothing here works without script anyway.
+
+    移出 is confirmed by **arming** the button rather than by a nested modal: a
+    second Bootstrap dialog over this one traps focus badly on a phone, and this
+    is the same treatment 删除用户 gets in the user modal. The warning says the
+    thing an admin needs to know — the guest goes back to pending, not away. %>
+<% if (isAdmin && !isPast) { %>
+  <div class="modal fade" id="guest-review-modal" tabindex="-1" role="dialog"
+       aria-labelledby="guest-review-title" aria-hidden="true"
+       data-guests="<%= JSON.stringify({
+         approved: approvedGuests,
+         pending: pendingGuests,
+         max: maxGuests,
+         full: approvedGuests.length >= maxGuests
+       }) %>">
+    <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="guest-review-title">审核/添加 试训/Guest</h5>
+          <button class="close" type="button" data-dismiss="modal" aria-label="关闭">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div id="guest-review-msg"></div>
+
+          <div class="guest-section">
+            <div class="guest-section-head">
+              已批准<span class="guest-section-count" id="guest-approved-count"></span>
+            </div>
+            <ul class="guest-review-list" id="guest-approved-list"></ul>
+          </div>
+
+          <div class="guest-section">
+            <div class="guest-section-head">
+              待批准<span class="guest-section-count" id="guest-pending-count"></span>
+            </div>
+            <ul class="guest-review-list" id="guest-pending-list"></ul>
+          </div>
+
+          <%# 直接添加 — no member request behind it, so the admin is always the
+              approver. 申请人 is the one thing they are asked: a guest an admin
+              adds is usually still coming through some member, and 由 X 提交 is
+              what the sidebar and both lists show — so it is a picker over the
+              club, defaulting to the admin themselves. Deliberately not a <form>:
+              it lives inside the dialog's body and a submit would navigate away
+              from it. %>
+          <div class="guest-section guest-add">
+            <div class="guest-section-head">直接添加</div>
+            <div class="form-group field-inline-sm">
+              <label for="guest-add-type">类型</label>
+              <select class="form-control" id="guest-add-type">
+                <% guestTypes.forEach(t => { %>
+                  <option value="<%= t.value %>"><%= t.label %></option>
+                <% }) %>
+              </select>
+            </div>
+            <div class="form-group field-inline-sm">
+              <label for="guest-add-name">姓名</label>
+              <input class="form-control" id="guest-add-name" type="text"
+                     maxlength="40" placeholder="试训/Guest 的姓名">
+            </div>
+            <%# `selected` in the markup, not from script — the default is the
+                signed-in admin, and nothing else ever moves it. %>
+            <div class="form-group field-inline-sm">
+              <label for="guest-add-by">申请人</label>
+              <select class="form-control" id="guest-add-by">
+                <% members.forEach(m => { %>
+                  <option value="<%= m.email %>"<%= m.email === user.email ? ' selected' : '' %>><%= m.name %></option>
+                <% }) %>
+              </select>
+            </div>
+            <button class="btn btn-brand btn-block" type="button" id="guest-add-btn">添加</button>
+            <p class="guest-add-hint" id="guest-add-hint"></p>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" type="button" data-dismiss="modal">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      var modalEl = document.getElementById('guest-review-modal');
+      if (!modalEl) return;
+      var EVENT_ID = '<%= event.id %>';
+      var msgEl = document.getElementById('guest-review-msg');
+      var approvedList = document.getElementById('guest-approved-list');
+      var pendingList = document.getElementById('guest-pending-list');
+      var approvedCount = document.getElementById('guest-approved-count');
+      var pendingCount = document.getElementById('guest-pending-count');
+      var addType = document.getElementById('guest-add-type');
+      var addName = document.getElementById('guest-add-name');
+      var addBy = document.getElementById('guest-add-by');
+      var addBtn = document.getElementById('guest-add-btn');
+      var addHint = document.getElementById('guest-add-hint');
+
+      // The server's render of the same payload every action answers with, so
+      // the first paint and every redraw after it go through one code path.
+      var state = JSON.parse(modalEl.getAttribute('data-guests'));
+      var busy = false;    // a request is in flight; every button is disabled
+      var armed = null;    // id of the 移出 currently asking for a second tap
+      var changed = false; // something was written; the page reloads on close
+
+      function say(kind, text) {
+        if (!text) { msgEl.innerHTML = ''; return; }
+        msgEl.innerHTML = '';
+        var box = document.createElement('div');
+        box.className = 'alert alert-' + kind + ' py-2';
+        box.textContent = text;
+        msgEl.appendChild(box);
+      }
+
+      // Every list row, both halves of the dialog. Built with textContent rather
+      // than a string of HTML: a guest's name is text a member typed.
+      function row(g, isApproved) {
+        var li = document.createElement('li');
+        li.className = 'guest-review-item';
+
+        var body = document.createElement('div');
+        body.className = 'guest-review-body';
+        var head = document.createElement('div');
+        head.className = 'guest-review-name';
+        var name = document.createElement('span');
+        name.className = 'guest-name';
+        name.textContent = g.name;
+        var type = document.createElement('span');
+        type.className = 'guest-type';
+        type.textContent = g.typeLabel;
+        head.appendChild(name);
+        head.appendChild(type);
+        var meta = document.createElement('div');
+        meta.className = 'guest-review-meta';
+        meta.textContent = isApproved
+          ? '由 ' + g.requestedByName + ' 提交 · ' + g.approvedByName + ' 批准于 ' + g.approvedAt
+          : '由 ' + g.requestedByName + ' 提交 · ' + g.requestedAt;
+        body.appendChild(head);
+        body.appendChild(meta);
+
+        var isArmed = isApproved && armed === g.id;
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-sm guest-review-btn '
+          + (isApproved ? (isArmed ? 'btn-danger' : 'btn-outline-danger') : 'btn-success');
+        btn.textContent = isApproved ? (isArmed ? '确认移出' : '移出') : '批准';
+        // A pending request cannot be approved into a full event; the 移出 beside
+        // an approved one is what frees a place, so it is never disabled.
+        btn.disabled = busy || (!isApproved && state.full);
+        btn.addEventListener('click', function () {
+          if (busy) return;
+          if (!isApproved) {
+            return post('/api/events/' + EVENT_ID + '/guests/' + g.id + '/approve', null,
+              '已批准「' + g.name + '」');
+          }
+          if (armed === g.id) {
+            return post('/api/events/' + EVENT_ID + '/guests/' + g.id + '/unapprove', null,
+              '已移出「' + g.name + '」，该申请回到待批准列表');
+          }
+          // First tap only arms it — and arming a second row disarms the first,
+          // since `armed` holds one id and the whole list is redrawn from it.
+          armed = g.id;
+          render();
+        });
+
+        li.appendChild(body);
+        li.appendChild(btn);
+        if (isArmed) {
+          var warn = document.createElement('p');
+          warn.className = 'guest-review-warn';
+          warn.textContent = '移出后「' + g.name + '」会回到待批准列表（不会被删除），'
+            + '名额释放给其他申请，提交人也可以重新取消该申请。再点一次确认。';
+          li.appendChild(warn);
+        }
+        return li;
+      }
+
+      function fill(list, rows, isApproved, empty) {
+        list.innerHTML = '';
+        if (!rows.length) {
+          var li = document.createElement('li');
+          li.className = 'guest-review-empty';
+          li.textContent = empty;
+          list.appendChild(li);
+          return;
+        }
+        rows.forEach(function (g) { list.appendChild(row(g, isApproved)); });
+      }
+
+      // The only thing that writes either list, the counts or the disabled
+      // states — so what the dialog shows can never disagree with `state`.
+      function render() {
+        approvedCount.textContent = '：' + state.approved.length + ' / ' + state.max;
+        pendingCount.textContent = '：' + state.pending.length;
+        fill(approvedList, state.approved, true, '还没有已批准的试训/Guest');
+        fill(pendingList, state.pending, false, '没有待批准的申请');
+        addBtn.disabled = busy || state.full;
+        addHint.textContent = state.full
+          ? '名额已满（最多 ' + state.max + ' 位），请先移出一位再添加'
+          : '直接添加的试训/Guest 立即占用名额，记录为由所选申请人提交、由你批准。';
+      }
+
+      function post(url, body, okMessage) {
+        busy = true;
+        render();
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body || {})
+        }).then(function (r) {
+          return r.json().then(function (data) {
+            if (data.ok) {
+              // The whole payload, re-read by the server after the write — so
+              // the dialog shows what the next admin to open it would see.
+              state = data.guests;
+              armed = null;
+              changed = true;
+              say('success', okMessage);
+            } else {
+              say('danger', data.message || '操作失败');
+            }
+          });
+        }).catch(function () {
+          say('danger', '网络错误，请重试');
+        }).then(function () {
+          busy = false;
+          render();
+        });
+      }
+
+      addBtn.addEventListener('click', function () {
+        if (busy) return;
+        var name = addName.value.trim();
+        if (!name) {
+          say('danger', '请填写试训/Guest 的姓名');
+          addName.focus();
+          return;
+        }
+        post(
+          '/api/events/' + EVENT_ID + '/guests',
+          // `requestedBy` is 申请人 — who the guest is coming through. Empty (an
+          // event with no member list to pick from) means the admin themselves,
+          // which is what the server falls back to.
+          { type: addType.value, name: name, requestedBy: addBy ? addBy.value : '' },
+          '已添加「' + name + '」'
+        );
+        addName.value = '';
+      });
+
+      render();
+
+      // Bootstrap's modal events are jQuery ones and jQuery loads in the footer,
+      // so the binding waits for window load — same as the 代签到 dialog.
+      window.addEventListener('load', function () {
+        if (!window.jQuery) return;
+        window.jQuery(modalEl)
+          .on('shown.bs.modal', function () {
+            say('', '');
+            armed = null;
+            render();
+          })
+          .on('hidden.bs.modal', function () {
+            // The sidebar's 试训/Guest block, the action-stack counts and the
+            // 分队 behind the dialog are all stale now; one fresh server render
+            // is simpler and more honest than patching them.
+            if (changed) location.reload();
+          });
+      });
+    })();
+  </script>
 <% } %>
 
 <%# 代签到. The dialog carries its own geolocation rather than borrowing the
@@ -621,6 +1080,30 @@
             if (didCheckIn) location.reload();
           });
       });
+
+      // 代签到 only exists once the check-in window is open, and the window can
+      // open while the page sits there — so the row is rendered `d-none` and
+      // revealed at OPENS_AT rather than making the admin reload. One timeout
+      // aimed at that instant, like the status badge's, clamped because
+      // setTimeout overflows past ~24.8 days; and re-read on every way the page
+      // can come back in front of the admin, since a backgrounded phone may
+      // never fire it. Measured against the server's clock, not the phone's.
+      (function () {
+        var row = document.getElementById('proxy-action');
+        if (!row) return;
+        var timer = null;
+        function apply() {
+          if (timer) { clearTimeout(timer); timer = null; }
+          var left = OPENS_AT - now();
+          if (!isFinite(OPENS_AT) || left <= 0) return row.classList.remove('d-none');
+          row.classList.add('d-none');
+          timer = setTimeout(apply, Math.min(left + 250, 2147483647));
+        }
+        apply();
+        document.addEventListener('visibilitychange', apply);
+        window.addEventListener('pageshow', apply);
+        window.addEventListener('focus', apply);
+      })();
     })();
   </script>
 <% } %>

@@ -80,9 +80,10 @@
 }
 
 /* A 试训/guest place — a body the club is expecting, not a member who signed up.
-   Softened rather than badged: it already sits last in its team and reads
-   试训Guest A, so the only job left is to keep it from being mistaken for a name
-   at a glance. Same treatment the waitlist gets on the roster grid. */
+   Softened rather than badged: it already sits last in its team and carries its
+   type in the name (张三（试训）), so the only job left is to keep it from being
+   mistaken for a member at a glance. Same treatment the waitlist gets on the
+   roster grid. */
 .team-name.is-guest {
   color: var(--gsf-ink-soft);
 }
@@ -96,9 +97,10 @@
   font-size: .875rem;
 }
 
-/* The head can carry a second count (总人数). Each is its own line rather than
-   one wrapped sentence: the block sits in the ~300px col-md-4 sidebar, where
-   "总人数（包含试训、guest）：11" is already close to the full width. */
+/* Its own line rather than part of a wrapped sentence — the block sits in the
+   ~300px col-md-4 sidebar, where one count is already close to the full width.
+   (The head used to carry a second, 总人数, which is why this exists at all; that
+   number is derived now and the line is gone.) */
 .roster-count {
   display: block;
 }
@@ -305,6 +307,227 @@
 .roster-fine-sample {
   color: #dc3545;
   font-weight: 700;
+}
+
+/* 试训/Guest — the sidebar block under the roster. A list rather than the avatar
+   grid the roster uses: a guest has no account and so no picture, and the thing
+   worth reading is the name plus who is bringing them. It reuses `.roster-head`
+   so it reads as another section of the same column. */
+.guest-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* One line per guest, wrapping inside itself on a phone rather than widening the
+   ~300px sidebar. `baseline` so the name, its type chip and the meta text sit on
+   one optical line when they do fit. */
+.guest-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .25rem .375rem;
+  margin-bottom: .375rem;
+  font-size: .875rem;
+}
+
+.guest-item:last-child {
+  margin-bottom: 0;
+}
+
+.guest-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* 试训 or Guest — a chip rather than parentheses, because the two kinds are read
+   against each other down a list and the name is what should carry the weight. */
+.guest-type {
+  flex: none;
+  padding: 0 .375rem;
+  border-radius: 999px;
+  background: var(--gsf-50);
+  color: var(--gsf-700);
+  font-size: .75rem;
+  line-height: 1.5;
+}
+
+.guest-meta {
+  min-width: 0;
+  color: var(--gsf-ink-soft);
+  font-size: .8125rem;
+  overflow-wrap: anywhere;
+}
+
+/* 已批准 and 待批准, stacked in the one block. The second is separated by a dashed
+   rule rather than sitting in a box of its own: they are two halves of one list,
+   and the sidebar has no room for a second bordered card. Only the *second* one
+   takes the rule, so whichever is rendered first runs straight on from the head
+   — which is what keeps it from stranding itself under the heading when there is
+   only one list to show. */
+.guest-section-sm + .guest-section-sm {
+  margin-top: .75rem;
+  padding-top: .625rem;
+  border-top: 1px dashed var(--gsf-line);
+}
+
+/* The heading is the only thing that says 已批准 / 待批准 — the rows under it do
+   not repeat themselves. 已批准 is green because it is the half that means a real
+   place at the event; 待批准 stays muted, like the queue it names. */
+.guest-sub-head {
+  margin-bottom: .375rem;
+  font-size: .8125rem;
+  color: var(--gsf-ink-soft);
+}
+
+.guest-sub-head.is-approved {
+  color: #28a745;
+  font-weight: 600;
+}
+
+.guest-sub-count {
+  color: var(--gsf-ink-faint);
+}
+
+/* The cancel form must not add layout — it is only there to carry the POST. */
+.guest-cancel {
+  margin: 0;
+}
+
+/* A link-weight control, but padded to stay a real touch target on a phone: it
+   sits at the end of a dense list line where a full `.btn` would break the row. */
+.guest-cancel-btn {
+  padding: .125rem .375rem;
+  border: 0;
+  border-radius: .25rem;
+  background: none;
+  color: #dc3545;
+  font-size: .8125rem;
+  line-height: 1.5;
+}
+
+.guest-cancel-btn:hover,
+.guest-cancel-btn:focus {
+  background: rgba(220, 53, 69, .08);
+  text-decoration: underline;
+}
+
+@media (hover: none) {
+  .guest-cancel-btn {
+    min-height: 2rem;
+    padding-right: .625rem;
+    padding-left: .625rem;
+  }
+}
+
+/* 审核/添加 试训/Guest dialog. Three stacked sections — approved, pending, add — each
+   headed and ruled off, so the two lists never read as one. */
+.guest-note {
+  margin-bottom: 1rem;
+  font-size: .8125rem;
+  line-height: 1.5;
+  color: var(--gsf-ink-soft);
+}
+
+.guest-section + .guest-section {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--gsf-line);
+}
+
+.guest-section-head {
+  margin-bottom: .5rem;
+  font-size: .9375rem;
+  font-weight: 600;
+  color: var(--gsf-ink);
+}
+
+.guest-section-count {
+  font-weight: 400;
+  color: var(--gsf-ink-soft);
+}
+
+.guest-review-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* [name + who/when][action], with the action holding its size at the end of the
+   row and the text half being the one that shrinks — so no name can push the
+   button off a 320px screen. The armed warning is a third child and takes the
+   full width under both. */
+.guest-review-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+  padding: .625rem 0;
+  border-bottom: 1px solid var(--gsf-line);
+}
+
+.guest-review-item:first-child {
+  padding-top: 0;
+}
+
+.guest-review-item:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+/* `flex-basis: 0`, not `auto`: with `flex-wrap: wrap` on the row, an `auto` basis
+   makes the browser weigh this half at its *max-content* width and drop the
+   button onto its own line the moment the "由 X 提交 · Y 批准于 …" line gets long
+   — which it does as soon as a member has a three-character name. A zero basis
+   never asks for that width, so the button stays at the end of the row and the
+   text is the half that wraps. The armed warning still takes a line of its own,
+   through its own `flex: 0 0 100%`. */
+.guest-review-body {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.guest-review-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .375rem;
+}
+
+.guest-review-meta {
+  margin-top: .125rem;
+  color: var(--gsf-ink-soft);
+  font-size: .8125rem;
+  overflow-wrap: anywhere;
+}
+
+.guest-review-btn {
+  flex: none;
+  min-width: 4.5rem;
+}
+
+/* The armed 移出's warning — the whole width of the row, under both halves, so
+   an admin reads what the second tap will do before making it. */
+.guest-review-warn {
+  flex: 0 0 100%;
+  margin: .375rem 0 0;
+  padding: .5rem .625rem;
+  border-radius: .25rem;
+  background: rgba(220, 53, 69, .08);
+  color: #a71d2a;
+  font-size: .8125rem;
+  line-height: 1.5;
+}
+
+.guest-review-empty {
+  color: var(--gsf-ink-soft);
+  font-size: .875rem;
+}
+
+.guest-add-hint {
+  margin: .5rem 0 0;
+  font-size: .8125rem;
+  color: var(--gsf-ink-soft);
 }
 
 /* 罚款统计 — the tally of a finished event, one line per tier. Deliberately a

@@ -76,19 +76,17 @@ CREATE TABLE IF NOT EXISTS gsffc.events (
   description TEXT,
   capacity    INTEGER NOT NULL DEFAULT 0,
   checkin_radius INTEGER NOT NULL DEFAULT 10,
-  -- 总人数（包含试训、guest）: the headcount the admin records by hand, counting
-  -- everyone who turned up — trialists and guests included — not just the members
-  -- who signed up in the app. Deliberately NOT derived from the roster and never
-  -- written by a signup or a check-in; the roster count and this one answer
-  -- different questions and are shown side by side. NULL means "not recorded",
-  -- which is what every event reads as until an admin fills it in, and is why the
-  -- column is nullable with no default rather than NOT NULL DEFAULT 0 — a 0 would
-  -- claim nobody came.
-  -- It is also what sizes 自动分队: three teams of ceil(total_headcount / 3) each,
-  -- computed on the fly, never stored — see `event_checkins.team_no`. While it is
-  -- NULL the teams are sized off `capacity` instead, so an event has teams from
-  -- its first check-in without waiting for an admin to record the real number.
-  total_headcount INTEGER,
+  -- NOTE: there used to be a `total_headcount` column here — 总人数（包含试训、
+  -- guest）, typed in by an admin, which is what 自动分队 sized its teams from.
+  -- It is **gone**: the team size is now 已报名人数 + 试训批准人数, derived from
+  -- `event_signups` and `event_guests` on every read (db.js `teamSize`), so
+  -- there is no longer a hand-maintained number that can fall out of agreement
+  -- with the roster it was supposed to describe.
+  -- Nothing in the app reads or writes the column any more, so a database that
+  -- still has it keeps working — dropping it is a manual
+  -- `ALTER TABLE gsffc.events DROP COLUMN total_headcount;`, which this file
+  -- deliberately does not do for you (it is written to be safe to re-apply, and
+  -- a destructive DDL has no business in that).
   visibility  TEXT NOT NULL DEFAULT 'ALL',
   CONSTRAINT events_end_after_start CHECK (end_at > start_at),
   CONSTRAINT events_visibility_shape CHECK (visibility IN ('ALL', 'ADMIN') OR visibility LIKE '%@%')
@@ -129,17 +127,18 @@ CREATE TABLE IF NOT EXISTS gsffc.event_signups (
 -- `team_no` is 自动分队: the team this member was allocated to at the moment they
 -- checked in, 1..3. The allocation is *random*, which is exactly why it is the
 -- one part of the feature that has to be stored — the team count (always 3) and
--- the team size (ceil(events.total_headcount / 3), or of `capacity` while 总人数
--- is NULL) are derived on every read and never written, so correcting an event's
--- 总人数 re-sizes its teams and no column can drift out of agreement with the
--- number it was computed from. Same arrangement as 迟到罚款.
+-- the team size (ceil((已报名人数 + 试训批准人数) / 3), i.e. the confirmed rows in
+-- `event_signups` plus the approved ones in `event_guests`) are derived on every
+-- read and never written, so the teams re-size as members sign up or withdraw and
+-- as guests are approved, and no column can drift out of agreement with the
+-- numbers it was computed from. Same arrangement as 迟到罚款.
 --
 -- It rides on the check-in rather than living in a table of its own because a
 -- member is allocated *by arriving*: withdrawing, 清空报名, deleting the member
 -- and deleting the event all drop the check-in row and take the allocation with
 -- it, so there is no new cascade anywhere. NULL means "not allocated" — a
--- check-in recorded before this feature existed, or one on an event with no team
--- size to fill against at all (no `total_headcount` and `capacity` 0).
+-- check-in recorded before this feature existed, or one on an event that had
+-- nobody signed up and no approved guest at all.
 CREATE TABLE IF NOT EXISTS gsffc.event_checkins (
   event_id      TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,
   email         TEXT NOT NULL,
@@ -157,3 +156,49 @@ CREATE TABLE IF NOT EXISTS gsffc.event_checkins (
 -- ordered by signup time.
 CREATE INDEX IF NOT EXISTS event_signups_queue_idx
   ON gsffc.event_signups (event_id, status, signed_up_at);
+
+-- 试训/Guest. A trialist or a guest has no account, so they can never sign up,
+-- never check in and never appear on the roster — this table is the only record
+-- of them, and it is what 自动分队 now sizes the guest places from. Before it
+-- existed their number was *guessed*, as 总人数 − 人数上限, and they were labelled
+-- A/B/C; the approved rows here replace that derivation entirely. The placement
+-- rule they are fed into is unchanged — see db.js `eventGuests`.
+--
+-- A row has two lives, and `approved_at` is which one it is in:
+--   NULL     — a pending request. Any member may submit as many as they like,
+--              and may cancel their own while it is still pending.
+--   NOT NULL — an approved place. **At most db.js MAX_EVENT_GUESTS (3) per
+--              event**, which is counted under the event's row lock rather than
+--              being expressible as a constraint here. Only an admin approves,
+--              and only an admin can send one back to pending ("移出"); the
+--              member who asked for it can no longer cancel it.
+-- The CHECK is what keeps the pair honest: an approval is a who *and* a when.
+--
+-- `type` is stored as the uppercase keyword, like `users.role` and
+-- `event_signups.status`; 试训 / Guest are the labels server.js renders it as.
+--
+-- Neither email carries a foreign key to `users`, for the same reason
+-- `event_signups.email` doesn't — and here there is a second one: an approved
+-- guest is a body the club is expecting, so deleting the member who invited them
+-- must not un-invite them mid-event. db.js `deleteUser` therefore drops that
+-- member's **pending** rows only (nobody could cancel them otherwise) and leaves
+-- the approved ones with the address on them, exactly as `checked_in_by` keeps a
+-- deleted admin's.
+CREATE TABLE IF NOT EXISTS gsffc.event_guests (
+  id           BIGSERIAL PRIMARY KEY,
+  event_id     TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,
+  type         TEXT NOT NULL CHECK (type IN ('TRIAL', 'GUEST')),
+  name         TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  approved_by  TEXT,
+  approved_at  TIMESTAMPTZ,
+  CONSTRAINT event_guests_approval_pair
+    CHECK ((approved_by IS NULL) = (approved_at IS NULL))
+);
+
+-- Both hot reads are one event's rows split into approved and pending, each half
+-- in the order it was decided in — which is also the order the guest places are
+-- handed out down the teams.
+CREATE INDEX IF NOT EXISTS event_guests_event_idx
+  ON gsffc.event_guests (event_id, approved_at, requested_at);
