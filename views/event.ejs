@@ -15,6 +15,20 @@
 <% const mdy = at => Number(at.slice(5, 7)) + '/' + at.slice(8, 10) + '/' + at.slice(2, 4); %>
 <% const whenLabel = mdy(event.startAt) + ' ' + clock(event.startAt) + ' - '
      + (event.endDate === event.date ? '' : mdy(event.endAt) + ' ') + clock(event.endAt); %>
+<%# What 复制 puts on the clipboard: one line per tier that actually has names,
+    "张三, 李四 罚款$5." — the shape the fines are pasted into the club's chat
+    group. A tier nobody owes contributes no line at all (unlike the panel
+    itself, which says 无). Built here rather than in script so the names are
+    escaped once, by EJS, on their way into the attribute.
+    Empty for a member and empty when nobody owes anything, and that emptiness
+    is the single test hiding both the button and its script — the same shape
+    `proxyTargets` uses. Announcing the fines is an admin's job, which is what
+    the button is for; the panel itself stays visible to everyone, so this
+    restricts who has the shortcut, not who can read the names. %>
+<% const fineCopyText = isAdmin
+     ? (fines || []).filter(f => f.names.length)
+       .map(f => f.names.join(', ') + ' 罚款$' + f.amount + '.').join('\n')
+     : ''; %>
 <%# The event's own state, and it is the one thing on this page that changes on
     its own three times: 签到已开放 when the check-in window opens an hour before
     kick-off, 活动已开始 at kick-off, 已结束 at the end. Before any of that it has
@@ -63,14 +77,27 @@
         shape every time and "nobody owes $10" is stated, not merely implied. %>
     <% if (fines) { %>
       <div class="event-fines mb-4">
-        <div class="event-fines-head">罚款统计</div>
+        <%# The copy button sits on the heading's line rather than under the
+            tiers: it acts on the whole panel, and a full-width button below the
+            note would read as another action of the event. Admin-only, and
+            absent when nobody owes anything — both are `fineCopyText` being
+            empty. %>
+        <div class="event-fines-head">
+          <span>罚款统计</span>
+          <% if (fineCopyText) { %>
+            <button class="btn btn-sm btn-outline-danger event-fine-copy" type="button"
+                    id="fine-copy-btn" data-copy="<%= fineCopyText %>">
+              <i class="fas fa-copy" aria-hidden="true"></i><span class="event-fine-copy-label">复制</span>
+            </button>
+          <% } %>
+        </div>
         <% fines.forEach(f => { %>
           <p class="event-fine-row">
             <span class="event-fine-amount<%= f.amount >= 10 ? ' is-heavy' : '' %>">$<%= f.amount %></span>罚款名单：<span class="event-fine-names<%= f.names.length ? '' : ' is-empty' %>"><%= f.names.length ? f.names.join(', ') : '无' %></span>
           </p>
         <% }) %>
         <p class="event-fine-note mb-0">
-          签到时间晚于开始时间即算迟到（开始后 1 分钟内不算）：迟到 5 分钟以内 $5，超过 5 分钟或未签到 $10。
+          签到时间晚于开始时间即算迟到：迟到 5 分钟以内 $5，超过 5 分钟或未签到 $10。
         </p>
       </div>
     <% } %>
@@ -110,6 +137,44 @@
   </div>
 
   <div class="col-md-4">
+    <%# 自动分队, above the roster: once a member is at the pitch, who they are
+        playing with matters more than who signed up, so it comes first. Only
+        somebody who has checked in sees it — an admin always does — and everyone
+        else gets the one-line reason rather than an unexplained gap. The teams
+        are named by mark alone (♠️ / ♥️ / 🪑), which is how they are called out
+        on the pitch; the label rides in `.sr-only` for a screen reader.
+        Which rows exist is the route's decision, not this template's: the two
+        playing teams are always there (empty saying 无), the 板凳 row only once
+        somebody has actually overflowed onto it — a 试训Guest counts, which is
+        why one guest and no members still raises the bench. Guests arrive in
+        `members` too, already sorted last, marked only by `isGuest`. %>
+    <% if (teams) { %>
+      <% const TEAM_MARKS = [
+           { mark: '♠️', label: '1 队' },
+           { mark: '♥️', label: '2 队' },
+           { mark: '🪑', label: '板凳' }
+         ]; %>
+      <div class="teams-block mb-4">
+        <div class="roster-head">分队</div>
+        <ul class="teams">
+          <% teams.forEach(t => { %>
+            <% const m = TEAM_MARKS[t.no - 1]; %>
+            <li class="team-row">
+              <span class="team-mark" aria-hidden="true"><%= m.mark %></span>
+              <span class="sr-only"><%= m.label %></span>
+              <%# One span per name rather than a joined string, so the viewer's
+                  own can be marked — it is the whole question they came with.
+                  The separator is written between the spans, on one line, or
+                  EJS's own newlines would land in front of every comma. %>
+              <span class="team-names<%= t.members.length ? '' : ' is-empty' %>"><% if (!t.members.length) { %>无<% } %><% t.members.forEach((tm, i) => { %><%= i ? ', ' : '' %><span class="team-name<%= tm.isMe ? ' is-me' : '' %><%= tm.isGuest ? ' is-guest' : '' %>"><%= tm.name %><% if (tm.isMe) { %><span class="sr-only">（你）</span><% } %></span><% }) %></span>
+            </li>
+          <% }) %>
+        </ul>
+      </div>
+    <% } else if (teamsLocked) { %>
+      <p class="teams-locked mb-4">签到后可查看分队</p>
+    <% } %>
+
     <%# The roster is an avatar grid, like the production app: gravatar over the
         member's name, wrapping to as many rows as it takes. A check-in shows as a
         green ring plus a tick badge rather than its own row-level label. It sits
@@ -228,12 +293,18 @@
 <div class="event-actions">
   <% if (!isPast) { %>
     <% if (signedUp) { %>
+      <%# Once you have checked in there is no 取消报名: the check-in is the record
+          that you turned up, and withdrawing would delete it along with your 分队
+          and your line in 罚款统计. The route refuses it too — this only decides
+          what renders. The note is then the whole row. %>
       <div class="event-action">
-        <form method="POST" action="/event/<%= event.id %>/withdraw">
-          <button class="btn btn-outline-danger btn-action" type="submit">取消报名</button>
-        </form>
+        <% if (!checkedIn) { %>
+          <form method="POST" action="/event/<%= event.id %>/withdraw">
+            <button class="btn btn-outline-danger btn-action" type="submit">取消报名</button>
+          </form>
+        <% } %>
         <span class="text-success event-action-note">
-          ✓ 你已报名<% if (checkedIn && myCheckinAt) { %>，<%= myCheckinAt %> 已签到<% } %>
+          ✓ 你已报名<% if (checkedIn) { %>，<% if (myCheckinAt) { %><%= myCheckinAt %> <% } %>已签到，不能取消报名<% } %>
         </span>
       </div>
     <% } else if (waitlisted) { %>
@@ -552,6 +623,69 @@
       });
     })();
   </script>
+<% } %>
+
+<%# 罚款统计 的复制按钮 — admin-only, via the same empty `fineCopyText` that
+    decides whether the button exists at all. The text is already on the button
+    as `data-copy`, so this only has to hand it to the clipboard and say that it did. `navigator.clipboard`
+    needs a secure context (which the check-in already requires) and can still be
+    refused by permission, so a hidden-textarea `execCommand` fallback stands
+    behind it — on a phone that means the paste keeps working over plain http on
+    the LAN, where the clipboard API is simply absent. %>
+<% if (fineCopyText) { %>
+<script>
+  (function () {
+    var btn = document.getElementById('fine-copy-btn');
+    if (!btn) return;
+    var label = btn.querySelector('.event-fine-copy-label');
+    var icon = btn.querySelector('i');
+    var revert = null;
+
+    function done(ok) {
+      // One state change, both halves of the button at once, so the icon and the
+      // word can never disagree. It falls back after 2s rather than staying, as
+      // the panel is copied again whenever the list is edited.
+      icon.className = ok ? 'fas fa-check' : 'fas fa-times';
+      label.textContent = ok ? '已复制' : '复制失败';
+      btn.classList.toggle('is-copied', ok);
+      if (revert) clearTimeout(revert);
+      revert = setTimeout(function () {
+        revert = null;
+        icon.className = 'fas fa-copy';
+        label.textContent = '复制';
+        btn.classList.remove('is-copied');
+      }, 2000);
+    }
+
+    // Pre-clipboard-API path, and the one that survives an insecure origin: a
+    // textarea off-screen (not `display:none`, which cannot be selected) is
+    // selected and copied, then removed.
+    function legacyCopy(text) {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      return ok;
+    }
+
+    btn.addEventListener('click', function () {
+      var text = btn.getAttribute('data-copy');
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text)
+          .then(function () { done(true); })
+          .catch(function () { done(legacyCopy(text)); });
+        return;
+      }
+      done(legacyCopy(text));
+    });
+  })();
+</script>
 <% } %>
 
 <%# The status badge moves on its own, and it belongs to everybody looking at the

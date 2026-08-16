@@ -32,6 +32,102 @@ const ROLES = [MEMBER, ADMIN];
 const SIGNED_UP = 'SIGNED_UP';
 const WAITLIST = 'WAITLIST';
 
+// 自动分队: an event is always split into this many teams. The number lives here
+// and nowhere else — `db/schema.sql` deliberately carries no CHECK on
+// `event_checkins.team_no`, so this module is what keeps that column to 1..3.
+// `pickTeam` fills the first two and treats the last as the overflow, so a
+// different count is a change to that function, not just to this constant.
+const TEAM_COUNT = 3;
+
+// Places per team: the event's headcount split three ways, rounded **up**, so 25
+// gives teams of 9 (9 + 9 + 7). Derived on every read and never stored, which is
+// what lets an admin correct an event's 总人数 and have its teams re-size with it.
+//
+// 总人数 is the number when it has been recorded, and 人数上限 (`capacity`) is the
+// fallback when it has not — an event always has one, so teams can be filled from
+// the first check-in without waiting for an admin to type the real headcount in.
+// The fallback is on **null only**: a recorded 0 is "nobody came", an answer, not
+// a blank, and it sizes no teams. null (nobody is allocated at all) is therefore
+// left for the event that has neither — no 总人数 and `capacity` 0, the column's
+// own default.
+function teamSize(totalHeadcount, capacity) {
+  const total = Number(totalHeadcount ?? capacity);
+  if (!Number.isFinite(total) || total <= 0) return null;
+  return Math.ceil(total / TEAM_COUNT);
+}
+
+// 自动分队 — the guests' names down the teams: A, B, C… Past Z a guest is
+// numbered instead; an event with 26 more bodies than places is well past
+// anything the club does.
+const GUEST_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+// 自动分队 — the 试训/guest places. A trialist or a guest has no account, so they
+// can never sign up, never check in and are never on the roster: the only trace
+// of them is 总人数 counting bodies that 人数上限 does not. Their number is
+// therefore exactly that difference, and their teams are hardcoded rather than
+// drawn —
+//
+//   1 guest  → the bench
+//   2 guests → the bench, plus the last place in one of the two playing teams
+//   3 guests → one each
+//
+// — with anything past three going onto the bench, which is already the overflow
+// for members. The difference only means something when the event has both
+// numbers: an event with no 人数上限 (`capacity` 0, the column's default) has no
+// member baseline to subtract from, so it has no guests either, and neither does
+// one whose 总人数 has not been recorded yet.
+//
+// **A playing team that is already full takes no guest**: the place goes to the
+// bench instead. Only the bench is uncapped, so a guest hardcoded into 黑桃/红桃
+// would otherwise push it to `size + 1` — which is exactly what happens whenever
+// members were allocated before the guests existed, i.e. every event whose 总人数
+// is filled in or corrected upwards after people have started checking in
+// (`teamSize` then re-sizes the teams, but nobody is ever re-allocated). `taken`
+// is what makes that visible here: the number of **members** already holding a
+// place in each team, a Map of team → count, from the caller that has them —
+// `rowToEvent` from the roster, `pickTeam` from its own count query. It is
+// members only; the guest places this function is deciding are added on top of it
+// as they are placed, so two guests can never be given the same last place.
+//
+// Derived on every read like everything else about a team, which is what rules
+// out drawing the second guest's playing team at random: a fresh draw would move
+// between renders, and `pickTeam` — which has to leave that place free — would
+// disagree with the page showing it. It comes from the event's own id instead,
+// so it is fixed for one event without being the same team on every event. Being
+// bumped to the bench is not a fresh draw: it is decided from the same check-in
+// rows both callers read, so both agree, and it only ever moves one way.
+//
+// Returns `[{ label, team }]` ordered by team, so the labels read A, B, C down
+// the list. The label is all this layer names them: 试训Guest A is UI text.
+function eventGuests(eventId, totalHeadcount, capacity, taken = new Map()) {
+  const total = Number(totalHeadcount);
+  const cap = Number(capacity);
+  if (totalHeadcount == null || !Number.isFinite(total) || !(cap > 0)) return [];
+  const count = Math.max(0, total - cap);
+  if (!count) return [];
+  const size = teamSize(totalHeadcount, capacity);
+  const id = String(eventId || '');
+  let sum = 0;
+  for (let i = 0; i < id.length; i++) sum += id.charCodeAt(i);
+  const first = 1 + (sum % 2);
+  const order = [TEAM_COUNT, first, 3 - first];
+  // The guest places handed out so far, so the second guest sees the first one's.
+  const held = new Map();
+  const place = wanted => {
+    // The bench is the overflow: it is never full and never bumps anybody on.
+    if (wanted === TEAM_COUNT) return TEAM_COUNT;
+    const used = (taken.get(wanted) || 0) + (held.get(wanted) || 0);
+    return size && used < size ? wanted : TEAM_COUNT;
+  };
+  return Array.from({ length: count }, (_, i) => {
+    const team = place(order[i] != null ? order[i] : TEAM_COUNT);
+    held.set(team, (held.get(team) || 0) + 1);
+    return team;
+  })
+    .sort((a, b) => a - b)
+    .map((team, i) => ({ label: GUEST_LABELS[i] || String(i + 1), team }));
+}
+
 // The two keyword values of `events.visibility`; anything else in that column is
 // a single member's email address. Constrained by a CHECK in db/schema.sql, so
 // these strings must stay in sync with it.
@@ -61,6 +157,12 @@ function rowToEvent(row, roster = []) {
   if (!row) return null;
   const startAt = String(row.start_at || '');
   const endAt = String(row.end_at || '');
+  // 自动分队 — the roster grouped by the team each member drew at check-in, always
+  // TEAM_COUNT arrays so an empty team is an empty array, not a hole. Hoisted out
+  // of the object below because the guest places are decided against it: a full
+  // playing team takes no guest — see `eventGuests`.
+  const teams = Array.from({ length: TEAM_COUNT }, (_, i) =>
+    roster.filter(s => s.team === i + 1).map(s => s.email));
   return {
     id: row.id,
     title: row.title,
@@ -84,7 +186,19 @@ function rowToEvent(row, roster = []) {
     roster,
     signups: roster.filter(s => s.status === SIGNED_UP).map(s => s.email),
     waitlist: roster.filter(s => s.status === WAITLIST).map(s => s.email),
-    checkins: roster.filter(s => s.checkedInAt).map(s => s.email)
+    checkins: roster.filter(s => s.checkedInAt).map(s => s.email),
+    // 自动分队, both read-only views like the three arrays above: `teamSize` is
+    // computed from 总人数, or from `capacity` until that is recorded, and `teams`
+    // is the roster grouped by team (built above).
+    teamSize: teamSize(row.total_headcount, row.capacity),
+    teams,
+    // The 试训/guest places, `[{ label, team }]` — see `eventGuests`, which is
+    // given how many members each team already holds so a full 黑桃/红桃 hands its
+    // guest to the bench instead of overflowing. They are not in `teams` above and
+    // never will be: that is the roster grouped by team, and a guest has no
+    // account and so no email to appear in it.
+    guests: eventGuests(row.id, row.total_headcount, row.capacity,
+      new Map(teams.map((members, i) => [i + 1, members.length])))
   };
 }
 
@@ -100,7 +214,11 @@ function rowToSignup(row) {
     // The admin who checked this member in on their behalf (代签到). NULL for
     // the ordinary case — a member who checked themselves in — so a non-null
     // value *is* the "this was a proxy check-in" flag the roster renders.
-    checkedInBy: row.checked_in_by || null
+    checkedInBy: row.checked_in_by || null,
+    // 自动分队: 1..TEAM_COUNT, drawn when the member checked in. null for a
+    // check-in made before the feature existed, and for one on an event that had
+    // no team size to fill against at all — see `teamSize`.
+    team: row.team_no != null ? row.team_no : null
   };
 }
 
@@ -392,7 +510,7 @@ async function getRosters(ids, client = pool) {
   if (!ids.length) return byEvent;
   const { rows } = await client.query(
     `SELECT s.event_id, s.email, s.status, s.signed_up_at, s.promoted_at,
-            c.checked_in_at, c.distance_m, c.checked_in_by
+            c.checked_in_at, c.distance_m, c.checked_in_by, c.team_no
      FROM ${SCHEMA}.event_signups s
      LEFT JOIN ${SCHEMA}.event_checkins c
        ON c.event_id = s.event_id AND c.email = s.email
@@ -504,29 +622,41 @@ async function signUpForEvent(eventId, email) {
   });
 }
 
-// Withdraw a member. Their check-in goes with the signup — it would otherwise
-// count someone who is no longer on the roster — and the place they free is
-// handed to the head of the waitlist in the same transaction.
-// Returns { removed, status, promoted } — or null when there is no such event.
+// Withdraw a member. The place they free is handed to the head of the waitlist
+// in the same transaction.
+//
+// **Arriving is final: a member who has checked in can no longer withdraw.**
+// Their check-in is the event's record that they turned up — it carries the
+// moment, the distance, their 分队 allocation and their line in 罚款统计 — and
+// deleting the signup would take all of it with it, which is a member erasing
+// their own $10 by tapping 取消报名 after the fact. `checkInToEvent` holds this
+// same event lock, so a check-in racing a withdrawal is serialised against the
+// read below and cannot slip in after it. The way out of a checked-in signup is
+// the admin's 清空报名, or SQL.
+// Returns { removed, status, promoted, checkedIn } — or null when there is no
+// such event. `checkedIn` is the one refusal that is not "you weren't signed up".
 async function withdrawFromEvent(eventId, email) {
   const normalized = String(email || '').trim().toLowerCase();
   return withEventLock(eventId, async (client, event) => {
+    const { rows: arrived } = await client.query(
+      `SELECT 1 FROM ${SCHEMA}.event_checkins WHERE event_id = $1 AND email = $2`,
+      [eventId, normalized]
+    );
+    if (arrived[0]) return { removed: false, status: null, promoted: [], checkedIn: true };
     const { rows } = await client.query(
       `DELETE FROM ${SCHEMA}.event_signups WHERE event_id = $1 AND email = $2
        RETURNING status`,
       [eventId, normalized]
     );
-    if (!rows[0]) return { removed: false, status: null, promoted: [] };
-    await client.query(
-      `DELETE FROM ${SCHEMA}.event_checkins WHERE event_id = $1 AND email = $2`,
-      [eventId, normalized]
-    );
+    if (!rows[0]) return { removed: false, status: null, promoted: [], checkedIn: false };
+    // No check-in row to delete alongside it: the guard above is what makes that
+    // true, so a withdrawal can no longer destroy one.
     // Only a confirmed place can free one up; a waitlister leaving changes
     // nothing but the queue behind them.
     const promoted = rows[0].status === SIGNED_UP
       ? await promoteFromWaitlist(client, eventId, event.capacity)
       : [];
-    return { removed: true, status: rows[0].status, promoted };
+    return { removed: true, status: rows[0].status, promoted, checkedIn: false };
   });
 }
 
@@ -541,6 +671,49 @@ async function clearEventRoster(eventId) {
   });
 }
 
+// 自动分队 — the team an arriving member joins, which is the club's rule exactly:
+// teams 1 and 2 are filled first (a random one of the two while both have room,
+// the one that still has room once the other is full), and once neither does,
+// everybody else goes into the last team. That last one is therefore the
+// overflow and is deliberately **uncapped**: 总人数 counts trialists and guests
+// who never check in, so the app's check-ins can outrun the number the teams
+// were sized from, and a member arriving must always land somewhere.
+//
+// The 试训/guest places are **already taken**: a trialist can never check in, so
+// nothing else would ever hold the place back for them and the last member to
+// arrive would take it. Counting them here is what makes "2 guests → 板凳组一个，
+// 红桃/黑桃最后一个checkin名额给另一个guest" true of the arrivals as well as of
+// the display. They are derived here rather than passed in, because which team a
+// guest lands in now depends on the very counts this function queries — a full
+// playing team hands its guest to the bench (see `eventGuests`), and the page
+// must not be shown a team the arrivals disagree with.
+//
+// Takes the event row the lock handed over, since the size and the guests both
+// come out of 总人数/人数上限. Returns null when there is no size to fill against —
+// see `teamSize`, i.e. an event with neither number — which is what leaves
+// `team_no` NULL and allocates nobody. The caller must hold the event lock from
+// `withEventLock`: this counts the rows and then writes one, so without it two
+// members checking in at the same moment could both take the last place in a team.
+async function pickTeam(client, eventId, event) {
+  const size = teamSize(event.total_headcount, event.capacity);
+  if (!size) return null;
+  const { rows } = await client.query(
+    `SELECT team_no, COUNT(*)::int AS taken FROM ${SCHEMA}.event_checkins
+     WHERE event_id = $1 AND team_no IS NOT NULL
+     GROUP BY team_no`,
+    [eventId]
+  );
+  // Members only, which is what `eventGuests` needs; the guest places go on top.
+  const taken = new Map(rows.map(r => [r.team_no, r.taken]));
+  const guests = eventGuests(eventId, event.total_headcount, event.capacity, taken);
+  for (const g of guests) taken.set(g.team, (taken.get(g.team) || 0) + 1);
+  const hasRoom = team => (taken.get(team) || 0) < size;
+  if (hasRoom(1) && hasRoom(2)) return crypto.randomInt(2) + 1;
+  if (hasRoom(1)) return 1;
+  if (hasRoom(2)) return 2;
+  return TEAM_COUNT;
+}
+
 // Record an arrival. The route has already checked that the member is confirmed
 // and inside the radius; the coordinates and the distance it computed are stored
 // as the evidence behind the row. Checking in twice keeps the first time, so
@@ -548,26 +721,50 @@ async function clearEventRoster(eventId) {
 // `by` is the admin who did it on the member's behalf (代签到) and is left NULL
 // for a member checking themselves in — the coordinates then belong to whoever
 // `by` names, since they are the one who was actually at the pitch.
-// Returns the check-in time, or null if there already was one.
+//
+// This runs inside `withEventLock`, unlike the plain INSERT it used to be: 自动分队
+// is decided here, and picking a team means counting the teams first — a
+// read-then-write that two simultaneous arrivals would otherwise interleave.
+// The lock also hands over the event row, which is where the team size comes from.
+// Returns { checkedInAt, team, created } — `created` false when the member was
+// already checked in, carrying that first row's time and team — or null when
+// there is no such event.
 async function checkInToEvent(eventId, email, { lat, lng, distance, by } = {}) {
   const normalized = String(email || '').trim().toLowerCase();
   const proxy = String(by || '').trim().toLowerCase();
-  const { rows } = await pool.query(
-    `INSERT INTO ${SCHEMA}.event_checkins (event_id, email, lat, lng, distance_m, checked_in_by)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (event_id, email) DO NOTHING
-     RETURNING checked_in_at`,
-    [
-      eventId,
-      normalized,
-      Number.isFinite(lat) ? lat : null,
-      Number.isFinite(lng) ? lng : null,
-      Number.isFinite(distance) ? Math.round(distance) : null,
-      // Checking yourself in is not a proxy check-in, however the caller phrased it.
-      proxy && proxy !== normalized ? proxy : null
-    ]
-  );
-  return rows[0] ? rows[0].checked_in_at : null;
+  return withEventLock(eventId, async (client, event) => {
+    const team = await pickTeam(client, eventId, event);
+    const { rows } = await client.query(
+      `INSERT INTO ${SCHEMA}.event_checkins
+         (event_id, email, lat, lng, distance_m, checked_in_by, team_no)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (event_id, email) DO NOTHING
+       RETURNING checked_in_at, team_no`,
+      [
+        eventId,
+        normalized,
+        Number.isFinite(lat) ? lat : null,
+        Number.isFinite(lng) ? lng : null,
+        Number.isFinite(distance) ? Math.round(distance) : null,
+        // Checking yourself in is not a proxy check-in, however the caller phrased it.
+        proxy && proxy !== normalized ? proxy : null,
+        team
+      ]
+    );
+    if (rows[0]) {
+      return { checkedInAt: rows[0].checked_in_at, team: rows[0].team_no, created: true };
+    }
+    // Already checked in — the row that was there wins, team included, so a
+    // double submit can never move somebody to another team.
+    const { rows: existing } = await client.query(
+      `SELECT checked_in_at, team_no FROM ${SCHEMA}.event_checkins
+       WHERE event_id = $1 AND email = $2`,
+      [eventId, normalized]
+    );
+    return existing[0]
+      ? { checkedInAt: existing[0].checked_in_at, team: existing[0].team_no, created: false }
+      : { checkedInAt: null, team: null, created: false };
+  });
 }
 
 // Insert a new event. The id is generated here — the seeded rows use 24-char
@@ -648,7 +845,7 @@ async function deleteEvent(id) {
 }
 
 module.exports = {
-  pool, ROLES, MEMBER, ADMIN, SIGNED_UP, WAITLIST,
+  pool, ROLES, MEMBER, ADMIN, SIGNED_UP, WAITLIST, TEAM_COUNT, teamSize, eventGuests,
   VISIBLE_ALL, VISIBLE_ADMIN, normalizeVisibility, canSeeEvent,
   getUsers, getUserByEmail, verifyPassword, createUser, upsertUser, updateUser, deleteUser,
   setUserPhoto, getUserPhoto,

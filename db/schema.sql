@@ -84,6 +84,10 @@ CREATE TABLE IF NOT EXISTS gsffc.events (
   -- which is what every event reads as until an admin fills it in, and is why the
   -- column is nullable with no default rather than NOT NULL DEFAULT 0 — a 0 would
   -- claim nobody came.
+  -- It is also what sizes 自动分队: three teams of ceil(total_headcount / 3) each,
+  -- computed on the fly, never stored — see `event_checkins.team_no`. While it is
+  -- NULL the teams are sized off `capacity` instead, so an event has teams from
+  -- its first check-in without waiting for an admin to record the real number.
   total_headcount INTEGER,
   visibility  TEXT NOT NULL DEFAULT 'ALL',
   CONSTRAINT events_end_after_start CHECK (end_at > start_at),
@@ -121,6 +125,21 @@ CREATE TABLE IF NOT EXISTS gsffc.event_signups (
 -- page's 代 badge tests. When it is set, `lat`/`lng`/`distance_m` are the
 -- **admin's** position, because the admin is the one who was at the pitch and
 -- passed the geofence. No foreign key, for the same reason `email` has none.
+--
+-- `team_no` is 自动分队: the team this member was allocated to at the moment they
+-- checked in, 1..3. The allocation is *random*, which is exactly why it is the
+-- one part of the feature that has to be stored — the team count (always 3) and
+-- the team size (ceil(events.total_headcount / 3), or of `capacity` while 总人数
+-- is NULL) are derived on every read and never written, so correcting an event's
+-- 总人数 re-sizes its teams and no column can drift out of agreement with the
+-- number it was computed from. Same arrangement as 迟到罚款.
+--
+-- It rides on the check-in rather than living in a table of its own because a
+-- member is allocated *by arriving*: withdrawing, 清空报名, deleting the member
+-- and deleting the event all drop the check-in row and take the allocation with
+-- it, so there is no new cascade anywhere. NULL means "not allocated" — a
+-- check-in recorded before this feature existed, or one on an event with no team
+-- size to fill against at all (no `total_headcount` and `capacity` 0).
 CREATE TABLE IF NOT EXISTS gsffc.event_checkins (
   event_id      TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,
   email         TEXT NOT NULL,
@@ -129,6 +148,7 @@ CREATE TABLE IF NOT EXISTS gsffc.event_checkins (
   lng           DOUBLE PRECISION,
   distance_m    INTEGER,
   checked_in_by TEXT,
+  team_no       SMALLINT,
   PRIMARY KEY (event_id, email)
 );
 

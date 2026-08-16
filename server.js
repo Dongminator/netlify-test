@@ -507,12 +507,56 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
       // member who never checked in — there is no arrival to be late by.
       fine,
       lateLabel: lateMs === null ? '' : lateLabel(lateMs),
+      // 自动分队: 1..3, drawn at check-in. Null for anybody who has not arrived,
+      // and for a check-in older than the feature — see db.js `pickTeam`.
+      team: signup.team,
       place: i + 1
     };
   };
   const participants = event.roster.filter(s => s.status === db.SIGNED_UP).map(toParticipant);
   const waitlist = event.roster.filter(s => s.status === db.WAITLIST).map(toParticipant);
   const mine = event.roster.find(s => s.email === req.session.user.email) || null;
+  // 自动分队 — visible only to somebody who has actually turned up. The teams are
+  // read at the pitch, by the people about to play, so checking in is the price
+  // of seeing them, and it is the **one** thing on this page an admin does not
+  // see by right: an admin who is playing checks in like everybody else (or is
+  // checked in by 代签到), and one who is not has no team to read. Deliberately
+  // no `me.role === db.ADMIN` branch here.
+  const seesTeams = !!mine && !!mine.checkedInAt;
+  const allocated = participants.filter(p => p.team);
+  // The two playing teams always render, an empty one saying so rather than
+  // vanishing — a team nobody has been drawn into yet is information, and the
+  // block would otherwise change shape as members arrive. The **bench** is the
+  // exception: it is the overflow, so an empty one means simply that nobody has
+  // overflowed, and a row saying 无 would be noise on every ordinary event.
+  // Null when there is nothing to show at all (nobody allocated yet, an event
+  // with no team size, or check-ins predating 自动分队), so the template has one
+  // test rather than a length check per team.
+  // Each name carries `isMe` so the viewer's own is marked in the list — the one
+  // thing they are looking for is which team they are in. Matched on **email**,
+  // never on the name, since two members can share one.
+  //
+  // The 试训/guest places (`event.guests`, hardcoded from 总人数 − 人数上限, see
+  // db.js `eventGuests`) come **after** every member of the team: they are the
+  // bodies nobody can name yet, so they sort last rather than into the middle of
+  // a list somebody is scanning for their own name. 试训Guest A is written here
+  // because it is UI text — db.js names them by label alone.
+  const teams = allocated.length && seesTeams
+    ? Array.from({ length: db.TEAM_COUNT }, (_, i) => ({
+      no: i + 1,
+      members: [
+        ...allocated.filter(p => p.team === i + 1).map(p => ({
+          name: p.name,
+          isMe: p.email === req.session.user.email
+        })),
+        ...event.guests.filter(g => g.team === i + 1).map(g => ({
+          name: `试训Guest ${g.label}`,
+          isMe: false,
+          isGuest: true
+        }))
+      ]
+    })).filter(t => t.no < db.TEAM_COUNT || t.members.length)
+    : null;
   res.render('event', {
     title: event.title,
     event,
@@ -530,6 +574,10 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
       : 0,
     checkedIn: !!mine && !!mine.checkedInAt,
     myCheckinAt: formatStamp(mine && mine.checkedInAt),
+    teams,
+    // There *are* teams, but this viewer hasn't earned sight of them yet — the
+    // page says why instead of silently showing nothing.
+    teamsLocked: !!allocated.length && !seesTeams,
     // Set by the redirect from POST /event/:id/signup when the event was full.
     joinedWaitlist: req.query.joined === 'waitlist',
     isPast,
@@ -585,8 +633,11 @@ app.post('/event/:id/signup', requireLogin, wrap(async (req, res) => {
   res.redirect(`/event/${req.params.id}${waitlisted ? '?joined=waitlist' : ''}`);
 }));
 
-// Leaving also drops the member's check-in, and hands the place they held to the
-// head of the waitlist — both inside `db.withdrawFromEvent`'s transaction.
+// Leaving hands the place the member held to the head of the waitlist, inside
+// `db.withdrawFromEvent`'s transaction. A member who has already checked in is
+// refused there — arriving is final, see the note on that function — and the
+// page has no 取消报名 button for them by then, so this lands back on the event
+// unchanged, the same shape as the frozen 清空报名 above.
 app.post('/event/:id/withdraw', requireLogin, wrap(async (req, res) => {
   const result = await db.withdrawFromEvent(req.params.id, req.session.user.email);
   if (!result) return res.status(404).render('404', { title: 'Not Found' });
@@ -650,13 +701,25 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
     return res.status(400).json({ ok: false, message: '你在候补名单中，补位成功后才能签到' });
   }
   if (mine.checkedInAt) {
+    // The allocation is never reached from here — the row already exists, and an
+    // existing row is never re-teamed. A check-in from before 自动分队 stays NULL.
     return res.json({ ok: true, message: '你已签到过了' });
   }
   const where = atTheField(event, req.body);
   if (where.status) return res.status(where.status).json(where.body);
-  // The coordinates go in with the time, as the evidence behind the row.
-  await db.checkInToEvent(event.id, email, where);
-  res.json({ ok: true, distance: where.distance, message: `签到成功！(距球场约 ${where.distance} 米)` });
+  // The coordinates go in with the time, as the evidence behind the row, and the
+  // 自动分队 draw happens in there too — `team` is null only when the event has no
+  // team size at all (no 总人数 *and* no capacity), the "no teams here" answer.
+  const done = await db.checkInToEvent(event.id, email, where);
+  // The event was deleted between the read above and the write; nothing was
+  // recorded, so this must not answer 签到成功.
+  if (!done) return res.status(404).json({ ok: false, message: '活动不存在' });
+  res.json({
+    ok: true,
+    distance: where.distance,
+    team: done.team,
+    message: `签到成功！(距球场约 ${where.distance} 米)`
+  });
 }));
 
 // 代签到 — an admin standing at the pitch checking in a member who can't do it
@@ -684,11 +747,15 @@ app.post('/event/:id/checkin-for', requireAdminApi, wrap(async (req, res) => {
   if (theirs.checkedInAt) return res.json({ ok: true, email: target, message: '该成员已签到过了' });
   const where = atTheField(event, req.body);
   if (where.status) return res.status(where.status).json(where.body);
-  await db.checkInToEvent(event.id, target, { ...where, by: req.session.user.email });
+  const done = await db.checkInToEvent(event.id, target, { ...where, by: req.session.user.email });
+  if (!done) return res.status(404).json({ ok: false, message: '活动不存在' });
   res.json({
     ok: true,
     email: target,
     distance: where.distance,
+    // The member's 自动分队 draw, so the dialog can name it as the admin works
+    // through the list; null when the event has no team size at all.
+    team: done.team,
     message: `代签到成功！(距球场约 ${where.distance} 米)`
   });
 }));

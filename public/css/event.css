@@ -20,6 +20,82 @@
   color: var(--gsf-ink-soft);
 }
 
+/* 自动分队 — one row per team above the roster, reusing `.roster-head` so the two
+   blocks read as one column. A row is [mark][names] on a single flex line with
+   only the names wrapping: the mark holds its size, so a long team never pushes
+   it out of alignment down the three rows. Sized for the ~300px col-md-4
+   sidebar, which is also what a phone gives it full width. */
+/* A hairline closes the block, the mirror of the one `.roster-head` opens 报名名单
+   with, so 分队 reads as a section of its own rather than running into the roster
+   below it. The padding keeps the rule nearer the last team than the heading it
+   separates them from. */
+.teams-block {
+  padding-bottom: .75rem;
+  border-bottom: 1px solid var(--gsf-line);
+}
+
+.teams {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.team-row {
+  display: flex;
+  align-items: baseline;
+  gap: .5rem;
+  margin-bottom: .5rem;
+  font-size: .875rem;
+}
+
+.team-row:last-child {
+  margin-bottom: 0;
+}
+
+/* The emoji is the team's name, so it is the one thing set larger than the row. */
+.team-mark {
+  flex: none;
+  font-size: 1.125rem;
+  line-height: 1;
+}
+
+/* `min-width: 0` so a long list wraps inside the row instead of widening it —
+   names are comma-joined and can run to several lines on a phone. */
+.team-names {
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+/* The viewer's own name, so "which team am I in" is answered by glance rather
+   than by reading the lists. A tinted chip on the brand ramp — 100 is a
+   background step, and the ink stays the 700 text step, which clears 4.5:1 over
+   it. Deliberately louder than bold alone: this is read at the pitch, outdoors,
+   on a phone, by somebody who is looking for exactly one word. */
+.team-name.is-me {
+  padding: .0625rem .375rem;
+  border-radius: 999px;
+  background: var(--gsf-100);
+  color: var(--gsf-700);
+  font-weight: 700;
+}
+
+/* A 试训/guest place — a body the club is expecting, not a member who signed up.
+   Softened rather than badged: it already sits last in its team and reads
+   试训Guest A, so the only job left is to keep it from being mistaken for a name
+   at a glance. Same treatment the waitlist gets on the roster grid. */
+.team-name.is-guest {
+  color: var(--gsf-ink-soft);
+}
+
+.team-names.is-empty,
+.teams-locked {
+  color: var(--gsf-ink-soft);
+}
+
+.teams-locked {
+  font-size: .875rem;
+}
+
 /* The head can carry a second count (总人数). Each is its own line rather than
    one wrapped sentence: the block sits in the ~300px col-md-4 sidebar, where
    "总人数（包含试训、guest）：11" is already close to the full width. */
@@ -243,11 +319,46 @@
   background: rgba(220, 53, 69, .04);
 }
 
+/* The title and the 复制 button share this line — the button acts on the whole
+   panel, so it belongs at its head rather than under the tiers. */
 .event-fines-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .5rem;
   margin-bottom: .5rem;
   font-size: .9375rem;
   font-weight: 600;
   color: var(--gsf-ink-soft);
+}
+
+/* Compact, but never below the 44px touch target on a phone — it sits on a
+   heading line, so the height comes from padding rather than a fixed box. */
+.event-fine-copy {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: .375rem;
+  padding: .25rem .625rem;
+  font-size: .8125rem;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+/* Success keeps the button's own colours rather than turning green: it is the
+   tick and the word that report the copy, and a second colour in a red panel
+   reads as a different kind of message. */
+.event-fine-copy.is-copied {
+  background: rgba(220, 53, 69, .1);
+}
+
+@media (hover: none) {
+  .event-fine-copy {
+    min-height: 2.25rem;
+    padding-right: .75rem;
+    padding-left: .75rem;
+  }
 }
 
 /* The name lists wrap freely; the tier is what must never break off its line. */
