@@ -43,7 +43,7 @@
 .team-row {
   display: flex;
   align-items: baseline;
-  gap: .5rem;
+  gap: .25rem;
   margin-bottom: .5rem;
   font-size: .875rem;
 }
@@ -52,11 +52,31 @@
   margin-bottom: 0;
 }
 
+/* Mark + count, held together so the count never wraps onto a line without the
+   team it counts. `flex: none` — the names are the half that wraps. */
+.team-head {
+  display: inline-flex;
+  align-items: baseline;
+  flex: none;
+  gap: .25rem;
+}
+
 /* The emoji is the team's name, so it is the one thing set larger than the row. */
 .team-mark {
   flex: none;
   font-size: 1.125rem;
   line-height: 1;
+}
+
+/* 目前几人/每队几人. Softened and set small: it qualifies the names, which are what
+   the block is read for. The 「：」 it ends with is the separator, which is why the
+   row's own gap is only .25rem — a full-width colon already carries space of its
+   own. */
+.team-count {
+  flex: none;
+  color: var(--gsf-ink-soft);
+  font-size: .8125rem;
+  font-variant-numeric: tabular-nums;
 }
 
 /* `min-width: 0` so a long list wraps inside the row instead of widening it —
@@ -98,9 +118,7 @@
 }
 
 /* Its own line rather than part of a wrapped sentence — the block sits in the
-   ~300px col-md-4 sidebar, where one count is already close to the full width.
-   (The head used to carry a second, 总人数, which is why this exists at all; that
-   number is derived now and the line is gone.) */
+   ~300px col-md-4 sidebar, where one count is already close to the full width. */
 .roster-count {
   display: block;
 }

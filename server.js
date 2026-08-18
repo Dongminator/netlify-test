@@ -563,7 +563,7 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
       // member who never checked in — there is no arrival to be late by.
       fine,
       lateLabel: lateMs === null ? '' : lateLabel(lateMs),
-      // 自动分队: 1..3, drawn at check-in. Null for anybody who has not arrived,
+      // 自动分队: 1..the event's 队伍数量, drawn at check-in. Null for anybody who has not arrived,
       // and for a check-in older than the feature — see db.js `pickTeam`.
       team: signup.team,
       place: i + 1
@@ -580,11 +580,14 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
   // no `me.role === db.ADMIN` branch here.
   const seesTeams = !!mine && !!mine.checkedInAt;
   const allocated = participants.filter(p => p.team);
-  // The two playing teams always render, an empty one saying so rather than
+  // The playing teams always render, an empty one saying so rather than
   // vanishing — a team nobody has been drawn into yet is information, and the
-  // block would otherwise change shape as members arrive. The **bench** is the
+  // block would otherwise change shape as members arrive. The **板凳** is the
   // exception: it is the overflow, so an empty one means simply that nobody has
-  // overflowed, and a row saying 无 would be noise on every ordinary event.
+  // overflowed, and a row saying 无 would be noise on every ordinary event. That
+  // is a 3-team thing only — in the 2- and 4-team layouts the last team is a
+  // playing team that happens to also be the overflow, and it renders like the
+  // rest.
   // Null when there is nothing to show at all (nobody allocated yet, an event
   // with no team size, or check-ins predating 自动分队), so the template has one
   // test rather than a length check per team.
@@ -597,8 +600,11 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
   // bodies who signed up through somebody else, so they sort last rather than
   // into the middle of a list somebody is scanning for their own name. The type
   // rides in the name here because it is UI text — db.js stores the keyword.
+  // 板凳 exists only in the 3-team layout, and it is the only row that can be
+  // dropped for being empty.
+  const benchNo = event.teamCount === 3 ? 3 : 0;
   const teams = allocated.length && seesTeams
-    ? Array.from({ length: db.TEAM_COUNT }, (_, i) => ({
+    ? Array.from({ length: event.teamCount }, (_, i) => ({
       no: i + 1,
       members: [
         ...allocated.filter(p => p.team === i + 1).map(p => ({
@@ -611,7 +617,7 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
           isGuest: true
         }))
       ]
-    })).filter(t => t.no < db.TEAM_COUNT || t.members.length)
+    })).filter(t => t.no !== benchNo || t.members.length)
     : null;
   // 试训/Guest. **Both lists are public** — who is coming and who has been asked
   // for is the same class of fact as the roster, and a member deciding whether to
@@ -934,7 +940,8 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
   if (where.status) return res.status(where.status).json(where.body);
   // The coordinates go in with the time, as the evidence behind the row, and the
   // 自动分队 draw happens in there too — `team` is null only when the event has no
-  // team size at all (no 总人数 *and* no capacity), the "no teams here" answer.
+  // team size at all (nobody signed up and no approved guest), the "no teams
+  // here" answer.
   const done = await db.checkInToEvent(event.id, email, where);
   // The event was deleted between the read above and the write; nothing was
   // recorded, so this must not answer 签到成功.
@@ -1276,10 +1283,11 @@ function validateEvent(event) {
   if (!Number.isInteger(event.checkinRadius) || event.checkinRadius <= 0) {
     return 'checkinRadius 必须为正整数';
   }
-  // Coerced in place to one of the column's three shapes, so what the routes
+  // Both coerced in place to the shapes their columns allow, so what the routes
   // then hand to `db.createEvent`/`updateEvent` is already normalized.
   try {
     event.visibility = db.normalizeVisibility(event.visibility);
+    event.teamCount = db.normalizeTeamCount(event.teamCount);
   } catch (err) {
     return err.message;
   }
@@ -1332,7 +1340,7 @@ app.put('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
 
   // `date`/`endDate`/`time` are derived from these two by `rowToEvent` and are
   // read-only — writing them would be silently dropped, so they are not listed.
-  const EDITABLE_FIELDS = ['title', 'startAt', 'endAt', 'location', 'coords', 'description', 'capacity', 'checkinRadius', 'visibility'];
+  const EDITABLE_FIELDS = ['title', 'startAt', 'endAt', 'location', 'coords', 'description', 'capacity', 'checkinRadius', 'visibility', 'teamCount'];
   for (const field of EDITABLE_FIELDS) {
     if (req.body[field] !== undefined) event[field] = req.body[field];
   }
@@ -1360,7 +1368,10 @@ app.post('/api/events', requireAdminApi, wrap(async (req, res) => {
     coords: req.body.coords === undefined ? null : req.body.coords,
     checkinRadius: req.body.checkinRadius === undefined ? 10 : req.body.checkinRadius,
     // Open to every member unless the form says otherwise.
-    visibility: req.body.visibility === undefined ? db.VISIBLE_ALL : req.body.visibility
+    visibility: req.body.visibility === undefined ? db.VISIBLE_ALL : req.body.visibility,
+    // 队伍数量 — 3 unless the form says otherwise, the same value every event
+    // written before the field existed reads as.
+    teamCount: req.body.teamCount === undefined ? db.DEFAULT_TEAM_COUNT : req.body.teamCount
   };
   const error = validateEvent(event) || await checkVisibilityTarget(event.visibility);
   if (error) return res.status(400).json({ ok: false, message: error });

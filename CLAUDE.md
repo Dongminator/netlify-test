@@ -67,9 +67,9 @@ runs it, `db.js` only opens a pool and queries. Consequences to remember:
   A whole new table needs neither form — `CREATE TABLE IF NOT EXISTS` covers both cases, constraints
   included, which is how `gsffc.event_guests` went in.
 - **Dropping a column is the one thing this file deliberately does not do.** It is run repeatedly, and
-  destructive DDL has no place in that, so a removed column is left in the live database and dropped by
-  hand — see `events.total_headcount`, which nothing reads any more and which needs
-  `ALTER TABLE gsffc.events DROP COLUMN total_headcount;` in `psql`.
+  destructive DDL has no place in that, so a column removed from the app is left in the live database
+  and dropped by hand with an `ALTER TABLE … DROP COLUMN` in `psql`. Nothing reads it in the meantime,
+  so an existing database goes on working untouched until somebody does.
 - `db/schema.sql` seeds only the three events; it seeds **no users**. Members are created from the
   "批量添加会员" modal on `/members` (paste `username:password` lines); its button and the modal
   itself only render for admins.
@@ -184,88 +184,121 @@ restricted event shows an amber `.cal-event.is-restricted` chip with a lock on t
 `badge-warning` beside the title on its page; both come from `visibilityLabel()` in server.js, which is
 null for an ordinary event, so the lock only ever appears to someone allowed to see the event anyway.
 
-**总人数 is gone, and nothing replaced it as a stored number.** There used to be an
-`events.total_headcount` column — 总人数（包含试训、guest）, typed in by an admin, deliberately
-disconnected from the roster, and what 自动分队 sized its teams from. It is **removed**: the team size is
-now `已报名人数 + 试训批准人数`, derived on every read from `event_signups` and `event_guests`
-(`db.teamSize`, below). The reason is the one that kept costing: a hand-typed number describing a roster
-the app already holds can only ever fall out of agreement with it, and an admin had to remember to keep
-it right — while the two numbers the club genuinely maintains, the signups and the approved guests,
-already add up to the answer.
+**No headcount is stored on an event but 人数上限.** The team size is `已报名人数 + 试训批准人数`,
+derived on every read from `event_signups` and `event_guests` (`db.teamSizes`, below), and 人数上限
+(`capacity`) caps the roster without sizing anything. A hand-typed number describing a roster the app
+already holds can only ever fall out of agreement with it, while the two numbers the club genuinely
+maintains — the signups and the approved guests — already add up to the answer.
 
-What that removal touched, all of it in this repo already: the column is out of `db/schema.sql`'s
-`CREATE TABLE` and out of every query in `db.js`, `event.totalHeadcount` is off the event object, the
-field is off the event modal (人数上限 now takes the row alone) and out of `validateEvent` and
-`EDITABLE_FIELDS`, and the 总人数 line is off the event page's `.roster-head`. `PUT /api/events/:id`
-therefore **ignores** a `totalHeadcount` in the body rather than erroring on it, since it is simply not
-an editable field any more.
+**队伍数量 is the admin's, and it is the one part of a team that is stored on the event.**
+`events.team_count` is **2, 3 or 4** (default 3, which is what every row written before the column reads
+as), picked from a `<select>` on the event form beside 人数上限. It used to be a hardcoded `TEAM_COUNT = 3`
+in db.js, which meant a 板凳 on an event the club was playing four-a-side. `db.TEAM_COUNTS` is the list,
+`db.normalizeTeamCount` is what nothing gets past — it throws on a stated value that is not one of the
+three and answers the default for an absent one, the same shape as `normalizeVisibility`, and it is
+called inside `createEvent`/`updateEvent` as well as from `validateEvent`, so the column cannot be
+reached unnormalized. A CHECK (`team_count BETWEEN 2 AND 4`) is the backstop. It is in `EDITABLE_FIELDS`,
+so a PUT that omits it keeps the current value, and `rowToEvent` exposes it as `event.teamCount`.
 
-**A live database keeps the column until it is dropped by hand.** Nothing reads or writes it, so an
-existing database goes on working untouched; removing it is
-`ALTER TABLE gsffc.events DROP COLUMN total_headcount;` in `psql`. `db/schema.sql` deliberately does
-**not** do that for you — it is written to be safe to re-apply, and destructive DDL has no place in a
-file that gets run repeatedly.
+**The teams are named by count**, and the names are UI text — db.js knows only numbers:
 
-**自动分队 is decided at check-in, and only the random draw is stored.** An event is always split into
-`db.TEAM_COUNT` (3) teams of `db.teamSize(signedUp, approvedGuests)` each — everybody who is coming
-divided three ways and rounded **up**, so 25 gives teams of 9 (9 + 9 + 7). **Who is coming is
+| 队伍数量 | 1 | 2 | 3 | 4 |
+| --- | --- | --- | --- | --- |
+| 2 | ♠️ 黑桃 | ♥️ 红桃 | | |
+| 3 | ♠️ 黑桃 | ♥️ 红桃 | 🪑 板凳 | |
+| 4 | ♠️ 黑桃 | ♥️ 红桃 | ♣️ 梅花 | ♦️ 方片 |
+
+**The last team is the overflow in every layout** — which is what makes the 3-team one's last team a
+bench, and what makes the 2- and 4-team ones' last team an ordinary side that happens to also absorb the
+overflow. Changing 队伍数量 on a live event **re-sizes the teams immediately** (the size is derived on
+every read) and **re-allocates nobody**, exactly as a signup or an approval does; lowering it past a team
+that already holds members leaves those members standing in a team that no longer exists in the layout.
+
+**自动分队 is decided at check-in, and only the random draw is stored.** An event is split into
+`event.teamCount` teams sized by `db.teamSizes(signedUp, approvedGuests, teamCount)` — everybody who is
+coming divided that many ways, **均分 with the remainder handed out from the first team forward**, so it
+answers **one number per team** rather than a single size: 9 in four teams is 3 / 2 / 2 / 2, 9 in two is
+5 / 4, 9 in three is 3 / 3 / 3, 25 in three is 9 / 8 / 8. Forwards is the mirror of `guestQuota`'s
+backwards and for the same reason: 黑桃 is the first team filled, so the odd body lands where the
+arrivals are already going. **It used to be one number for every team — the total rounded up** — which is
+a size no uneven split can be true of: 9 in four teams gave four teams of 3, i.e. room for 12, so the
+page promised places the event did not have and 方片 was left standing empty while 梅花 filled.
+**Who is coming is
 已报名人数 + 试训批准人数**: the event's confirmed `event_signups` plus its approved `event_guests`. The
 **waitlist is deliberately not in it** — a waitlisted member has no place at the event yet, so they are
 nobody's teammate until they are promoted, at which point the size grows on its own. `capacity`
 (人数上限) has **no part** in it either: it caps the roster, it does not size the teams.
 
-`teamSize` answers `null` only for an event with nobody on it at all — no signups and no approved guest
-— and the first signup makes it 1. Both halves are already in hand wherever it is called, so it costs no
+`teamSizes` answers `null` only for an event with nobody on it at all — no signups and no approved guest
+— and the first signup makes it `[1, 0, 0]`. A team's number is legitimately **0** when fewer people are
+coming than there are teams. Both halves are already in hand wherever it is called, so it costs no
 query of its own: `rowToEvent` counts them off the roster and the guest rows it was handed, `pickTeam`
 reads both under the event lock.
 
-The count and the size are derived on every read, never written, so the teams **re-size as members sign
-up, withdraw or are promoted and as guests are approved** — the same way correcting `startAt` re-prices
-its 迟到罚款. The one thing that cannot be re-derived is which team a member drew, and that is the whole
-content of `event_checkins.team_no` (1..3, NULL for "not allocated"). It rides on the check-in row rather
+The sizes are derived on every read, never written, so the teams **re-size as members sign
+up, withdraw or are promoted, as guests are approved, and as an admin changes 队伍数量** — the same way
+correcting `startAt` re-prices its 迟到罚款. The one thing that cannot be re-derived is which team a
+member drew, and that is the whole content of `event_checkins.team_no` (1..`team_count`, NULL for "not
+allocated"). It rides on the check-in row rather
 than in a table of its own because a member is allocated **by arriving**: 清空报名, deleting the member
 and deleting the event all drop that row and take the allocation with it, so there is no new cascade
 anywhere. Withdrawing no longer does, because a member who has arrived can no longer withdraw at all —
-see 迟到罚款/check-in below. `db/schema.sql` deliberately carries **no CHECK** on the column — `TEAM_COUNT` and
-`pickTeam` in [db.js](db.js) are what keep it to 1..3.
+see 迟到罚款/check-in below. `db/schema.sql` deliberately carries **no CHECK** on that column —
+`pickTeam` in [db.js](db.js) is what keeps it inside the event's own count.
 
-`pickTeam` is the club's rule exactly: **teams 1 and 2 are filled first** — a random one of the two
-(`crypto.randomInt`) while both have room, the one that still has room once the other is full — and once
-neither does, everybody else goes into **team 3, which is the overflow and is deliberately uncapped**.
-It is not round-robin, and that has a visible consequence: the size counts everybody signed up and every
-approved guest, and plenty of them never check in — so 21 expected with 15 arrivals gives 7 / 7 / 1
-rather than an even split. That is intended. Two things leave `team_no` NULL: an event with **nobody on
-it at all** (no signups and no approved guest, where `teamSize` answers null), and any check-in made
-before the feature existed.
+`pickTeam` is the club's rule exactly, in all three layouts: **each team is filled to its own number**
+(`teamSizes[team - 1]`, never one figure shared by all of them) and **the teams are filled in pairs** — a
+random one of the pair (`crypto.randomInt`) while both have room, the one that still has room once the
+other is full, moving on to the next pair when neither does — and **whatever is left over goes into the
+last team, which is the overflow and is deliberately uncapped**. So 黑桃/红桃 fill first everywhere; a
+2-team event then keeps pouring into 红桃, a 3-team one onto the 板凳, and a 4-team one draws randomly
+between 梅花/方片 before settling on 方片. An odd `teamCount` leaves its last team out of the pairing
+loop, which is right — that one is the overflow and is answered after it.
 
-**The size moves after people have been allocated, and nobody is ever re-allocated.** A signup, a
-withdrawal, a promotion off the waitlist or a guest approval all change it, but allocation only ever
-happens at the moment of check-in — so a team can end up holding more than the current size (members
-withdrawing after arriving) or less (people signing up after the early arrivals were drawn). That is the
-same trade the old hand-typed 总人数 had, and it is why `pickTeam`'s last team is uncapped. A
-re-allocation entry point would be a new function holding the event lock.
+It is not round-robin, and that has a visible consequence: the sizes count everybody signed up and every
+approved guest, and plenty of them never check in — so 21 expected in three teams with 15 arrivals gives
+7 / 7 / 1 rather than an even split. That is intended. Two things leave `team_no` NULL: an event with
+**nobody on it at all** (no signups and no approved guest, where `teamSizes` answers null), and any
+check-in made before the feature existed.
 
-**试训/guest places are hardcoded, not drawn.** A trialist or a guest has no account, so they can never
-sign up, never check in and are never on the roster — `gsffc.event_guests` is the only record of them
-(see 试训/Guest below), and `db.eventGuests(id, guests, size, taken)` turns its **approved** rows into
-their places: **1 → the bench; 2 → the bench plus the last place in one of the two playing teams;
-3 → one each**, anything past three onto the bench, which is already the members' overflow. It answers
-those same guests each with a `team`, **ordered by it**, and `rowToEvent` hangs the result off the event
-as `event.guests` — a derived read-only view like `teams` itself. Guests are deliberately **not** in
-`event.teams`: that is the roster grouped by team, and a guest has no email to appear in it.
+**The sizes move after people have been allocated, and nobody is ever re-allocated.** A signup, a
+withdrawal, a promotion off the waitlist or a guest approval all change them, but allocation only ever
+happens at the moment of check-in — so a team can end up holding more than its current number (members
+withdrawing after arriving) or less (people signing up after the early arrivals were drawn). That trade
+is deliberate, and it is why `pickTeam`'s last team is uncapped. A re-allocation entry point would be a
+new function holding the event lock.
 
-**The number of guests used to be a guess, and is now a fact.** Before the table existed the count was
-总人数 − 人数上限 and they were labelled A, B, C; the approved rows replaced that derivation entirely, and
-**nothing else about the rule moved** — the same three placements, the same bench overflow, the same
-`taken` bump. Neither 总人数 (now gone) nor `capacity` has any part in it, and the "anything past three"
-clause is the safety net rather than the normal path, since `db.MAX_EVENT_GUESTS` caps an event at three
-approved guests.
+**试训/guest places are shared out evenly, not drawn.** A trialist or a guest has no account, so they can
+never sign up, never check in and are never on the roster — `gsffc.event_guests` is the only record of
+them (see 试训/Guest below), and `db.eventGuests(guests, size, taken, teamCount)` turns its **approved**
+rows into their places. It is two steps, and neither is random:
 
-**A full playing team takes no guest — the place goes to the bench.** Only 板凳 is uncapped, so a guest
-hardcoded into ♠️/♥️ that already holds `teamSize` members would put that team at `size + 1`, and the
+1. **How many places each team gets** is `db.guestQuota(count, teamCount)`: **均分, with the remainder
+   handed out from the last team backwards**. 2 teams and 1 guest → 红桃; 3 teams and 2 → 板凳 then 红桃;
+   4 teams and 3 → 方片, 梅花, 红桃. Backwards, because 黑桃 is the first team filled at check-in, so a
+   place held back there is the one most likely to be wanted by an arriving member — and with fewer
+   guests than teams the remainder never reaches 黑桃 at all.
+2. **Which guest takes which** is **申请时间 order** (`requestedAt`, ties on the id) poured down the teams
+   in the order they are filled at check-in (黑桃 → 红桃 → …), so the earliest request lands in the first
+   team with a place for one.
+
+It answers those same guests each with a `team`, **ordered by it**, and `rowToEvent` hangs the result off
+the event as `event.guests` — a derived read-only view like `teams` itself. Guests are deliberately
+**not** in `event.teams`: that is the roster grouped by team, and a guest has no email to appear in it.
+
+**An earlier version of this rule is gone.** The *placement* used to be hardcoded as 1 → bench / 2 →
+bench plus one playing team (from a sum over the event id) / 3 → one each, which only ever described a
+3-team event — `guestQuota` replaced that, and the even split gives the same answer for the 3-guest case
+it used to. `capacity` has no part in it. `db.MAX_EVENT_GUESTS` still caps an event at three approved
+guests, so the quota never has to divide more than three.
+
+**A full team takes no guest — the place goes to the last team.** Only the last team is uncapped, so a
+guest placed into a team already holding **its own** `teamSizes` number of members would put it one past
+it (the test is per team, not against a shared size, so 黑桃 and 红桃 can fill at different numbers), and the
 members standing in it are already allocated and are never moved. This is not a rare case: it is what
 happens whenever a guest is approved after people have started checking in — the teams re-size but
-nobody is re-allocated, so the guest place can land on a team that filled up under the old size. `taken`, the fourth argument, is what makes that visible — a Map of team → the number of
+nobody is re-allocated, so the guest place can land on a team that filled up under the old size. `taken`,
+the third argument, is what makes that visible — a Map of team → the number of
 **members** already in it, from the caller that has them (`rowToEvent` from `event.teams`, `pickTeam` from
 its own count query). It is members only; the guest places being decided are counted on top of it as they
 are placed, so two guests can never be handed the same last place. The bump only ever moves one way, and
@@ -274,18 +307,21 @@ cannot disagree.
 
 **`pickTeam` counts the guest places as already taken.** Nothing else would ever hold them back — a
 trialist cannot check in — so the last member to arrive would simply take the place meant for them, and
-the page showing a guest in ♠️ would be describing a team that is actually full of members. This is
-also the whole reason the second guest's playing team **cannot** be a random draw the way a member's is:
-it is derived on every read, so a fresh draw would move between renders *and* disagree with the room
-`pickTeam` left. It comes from a sum over the event's own id instead — fixed for one event, evenly split
-across events (verified over 2000 random ids: 1025 / 975).
+the page showing a guest in ♠️ would be describing a team that is actually full of members. That is also
+why the placement **cannot** be a draw the way a member's is: it is derived on every read, so a fresh
+draw would move between renders *and* disagree with the room `pickTeam` left. 申请时间 and arithmetic are
+what make both callers reach the same answer from the same rows — `eventGuests` sorts its input itself
+rather than trusting the order the query handed it, since `getEventGuests` orders the approved half by
+`approved_at` (已批准 then 待批准, the order the page renders the two lists in) and `pickTeam` reads its
+own.
 
 Because the guests' teams depend on those same counts, **`pickTeam` derives them itself** rather than
 being handed them: it takes `(client, eventId, event)` — the row `withEventLock` hands over, which is
-where `teamSize` comes from — counts the check-ins per team, **SELECTs the event's approved guest rows
-inside the same lock**, calls `db.eventGuests` with that members-only Map, and only then adds the guest
-places to it before testing for room. That read is inside the lock with everything else, so an approval
-landing mid-check-in is serialised against it rather than being counted twice or not at all.
+where `team_count` comes from — counts the confirmed signups and the check-ins per team, **SELECTs the
+event's approved guest rows inside the same lock**, calls `db.eventGuests` with that members-only Map,
+and only then adds the guest places to it before testing for room. Those reads are inside the lock with
+everything else, so an approval landing mid-check-in is serialised against them rather than being counted
+twice or not at all.
 
 **`checkInToEvent` therefore runs inside `withEventLock`** and is no longer a lone INSERT: picking a team
 means counting the teams first, and that read-then-write is exactly what two simultaneous arrivals would
@@ -294,8 +330,10 @@ team size is computed from. It now answers `{checkedInAt, team, created}` (`crea
 was already checked in, carrying the **first** row's team, so a double submit can never move somebody) or
 `null` when the event is gone, which both check-in routes now 404 on rather than reporting a success
 nothing recorded. `rowToSignup` exposes the column as `roster[].team`, and `rowToEvent` derives
-`event.teamSize` and `event.teams` (always 3 arrays of emails, an empty team being an empty array) as
-read-only views beside `signups`/`waitlist`/`checkins`. Both check-in routes return `team` in their JSON.
+`event.teamSizes` (one number per team, null when nobody is coming) and `event.teams` (always
+`event.teamCount` arrays of emails, an empty team being an
+empty array) as read-only views beside `signups`/`waitlist`/`checkins`. Both check-in routes return
+`team` in their JSON.
 
 **试训/Guest is one table with two lives, and `approved_at` is which one a row is in.**
 `gsffc.event_guests` is the club's record of the people coming who have no account — the thing 自动分队
@@ -427,21 +465,39 @@ with matters more than who signed up. Checking in is the price of seeing it, and
 thing on the page **an admin does not see by right** — `seesTeams` deliberately has no `ADMIN` branch:
 an admin who is playing checks in like everybody else (or is checked in through 代签到), and one who is
 not has no team to read. `/event/:id` decides this once (`seesTeams`) and hands the template two locals:
-`teams` — `db.TEAM_COUNT` rows of `{no, members:[{name, isMe, isGuest}]}`, or **null** when there is
+`teams` — `event.teamCount` rows of `{no, members:[{name, isMe, isGuest}]}`, or **null** when there is
 nothing to show (nobody allocated, or the viewer hasn't earned it), so the template has one test — and
 `teamsLocked`, true only
 when teams exist but this viewer may not see them, which renders 签到后可查看分队 instead of an
 unexplained gap. `toParticipant` carries `team` for both.
 
-A team is named by its **mark alone** — ♠️ (1), ♥️ (2), 🪑 (板凳, 3) — because that is how they are
-called out on the pitch; the text label rides in a `.sr-only` span beside it. `TEAM_MARKS` is a const at
-the top of the block in [event.ejs](views/event.ejs), so a fourth team means adding to it *and* to
-`TEAM_COUNT`. **The two playing teams always render**, an empty one saying 无 rather than vanishing, so
-the block does not change shape as members arrive; the **板凳 row appears only once somebody is on it**,
-since an empty bench just means nobody overflowed — a 试训/Guest counts, so one guest and no members still
-raises it. That filter is the route's, not the template's — the
-template renders the rows it is given. The row carries **no headcount**: the names are the answer, and a
-number beside them was noise.
+A team is named by its **mark alone** — ♠️ ♥️ ♣️ ♦️ 🪑, per the 队伍数量 table above — because that is
+how they are called out on the pitch; the text label rides in a `.sr-only` span beside it. `TEAM_MARKS`
+in [event.ejs](views/event.ejs) is a map **keyed by `event.teamCount`**, so a fifth mark or a new layout
+means adding to it *and* to `db.TEAM_COUNTS` (and to the schema's CHECK). An unknown count falls back to
+the bare number rather than crashing the page.
+
+**The playing teams always render**, an empty one saying 无 rather than vanishing, so the block does not
+change shape as members arrive; the **板凳 row appears only once somebody is on it**, since an empty
+bench just means nobody overflowed — a 试训/Guest counts, so one guest and no members still raises it.
+That exception is the **3-team layout's alone** (`benchNo` in `/event/:id` is 3 there and 0 otherwise):
+in the 2- and 4-team layouts the last team is a real side that happens to also be the overflow, so it
+renders like the rest. The filter is the route's, not the template's — the
+template renders the rows it is given.
+
+**Each row is counted, and the heading says the size once**: the block's head reads 分队（每队 3 人）and
+every row reads ♠️（2/3人）：names — both halves out of `event.teamSizes`, which is why the heading drops
+the parenthetical and the row falls back to a bare 目前几人 when it is null (an event with nobody on it,
+which this block cannot be showing anyway). **The row's right-hand number is that team's own**, so the
+teams carrying the remainder read one higher than the rest; the heading, having room for one figure,
+states it when every team agrees and the **span** (每队2-3人) when they do not — `low`/`high` off the same
+array, not a second rule. **目前几人 counts a 试训/Guest place like a member**, since it
+holds a place at the event exactly as one does. **The right half is the size the teams are filled to, not
+a maximum** — the last team is the overflow and is uncapped, and nobody is ever re-allocated when the
+size moves — so `3/2人` is a legitimate reading, not a bug. The mark and the count are one `.team-head`
+flex item so the count can never wrap away from its team; the names are the half that wraps
+(`min-width: 0`). The row's `gap` is `.25rem` rather than `.5rem` because the count ends in a
+full-width 「：」 that carries space of its own.
 
 **A guest rides in `members` like anybody else, last in its team.** The route appends
 `event.guests` after the team's members with `name: g.name + '（' + guestTypeLabel(g.type) + '）'` — that
@@ -535,8 +591,10 @@ dropdown: the modal body is a scroll container and would clip an overlay. It is 
 `.field-inline-sm` wrapper around label+input, not a child — under `sm` that class makes its children one
 flex row and the list would join the line.
 
-**人数上限 is the only headcount on the form**, and it takes the full width. It used to share a
-`col-sm-6` row with 总人数; that field is gone (see above), so the pair went with it. 地点 still has the
+**人数上限 shares its `col-sm-6` row with 队伍数量**, the two halves of one decision — how many places
+there are, and how many ways they are split. 队伍数量 is a `<select>` of 2/3/4 carrying `selected` in
+the **markup**, not from script, like both 可见范围 `<select>`s and for the same reason: `form.reset()`
+in `setMode` is what restores the prefill, so a 复制 keeps the original's team count. 地点 still has the
 whole width to itself, which is what gives the geocoder's results list room.
 
 **开始时间 and 结束时间 are two `datetime-local` inputs that need no conversion at all.** `start_at` and

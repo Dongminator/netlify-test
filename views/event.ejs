@@ -171,27 +171,55 @@
         playing with matters more than who signed up, so it comes first. Only
         somebody who has checked in sees it — an admin always does — and everyone
         else gets the one-line reason rather than an unexplained gap. The teams
-        are named by mark alone (♠️ / ♥️ / 🪑), which is how they are called out
-        on the pitch; the label rides in `.sr-only` for a screen reader.
-        Which rows exist is the route's decision, not this template's: the two
-        playing teams are always there (empty saying 无), the 板凳 row only once
-        somebody has actually overflowed onto it — a 试训Guest counts, which is
-        why one guest and no members still raises the bench. Guests arrive in
-        `members` too, already sorted last, marked only by `isGuest`. %>
+        are named by mark alone (♠️ / ♥️ / ♣️ / ♦️ / 🪑), which is how they are
+        called out on the pitch; the label rides in `.sr-only` for a screen reader.
+        Which rows exist is the route's decision, not this template's: the playing
+        teams are always there (empty saying 无), the 板凳 row only once somebody
+        has actually overflowed onto it — a 试训Guest counts, which is why one
+        guest and no members still raises the bench. Guests arrive in `members`
+        too, already sorted last, marked only by `isGuest`. %>
     <% if (teams) { %>
-      <% const TEAM_MARKS = [
-           { mark: '♠️', label: '1 队' },
-           { mark: '♥️', label: '2 队' },
-           { mark: '🪑', label: '板凳' }
-         ]; %>
+      <%# 队伍数量 is per event (2/3/4) and decides both how many rows there are
+          and what they are called: the 板凳 exists only in the 3-team layout,
+          where the last team is the overflow rather than a side of its own.
+          A fifth mark means adding to this map *and* to db.js TEAM_COUNTS. %>
+      <% const TEAM_MARKS = ({
+           2: [{ mark: '♠️', label: '黑桃' }, { mark: '♥️', label: '红桃' }],
+           3: [{ mark: '♠️', label: '黑桃' }, { mark: '♥️', label: '红桃' },
+               { mark: '🪑', label: '板凳' }],
+           4: [{ mark: '♠️', label: '黑桃' }, { mark: '♥️', label: '红桃' },
+               { mark: '♣️', label: '梅花' }, { mark: '♦️', label: '方片' }]
+         })[event.teamCount] || []; %>
+      <%# 每队几人 is `event.teamSizes` — 已报名人数 + 试训批准人数 split 队伍数量
+          ways, **one number per team** because the split is rarely even (9 in
+          four teams is 3/2/2/2). Derived on every read, so it moves as members
+          sign up or guests are approved. The heading states the one number when
+          every team has the same, and the span (每队2-3人) when they do not; each
+          row then carries its own. %>
+      <% const sizes = event.teamSizes || [];
+         const low = sizes.length ? Math.min(...sizes) : 0;
+         const high = sizes.length ? Math.max(...sizes) : 0; %>
       <div class="teams-block mb-4">
-        <div class="roster-head">分队</div>
+        <div class="roster-head">分队<% if (sizes.length) { %>（每队<%= low === high ? low : low + '-' + high %>人）<% } %></div>
         <ul class="teams">
           <% teams.forEach(t => { %>
-            <% const m = TEAM_MARKS[t.no - 1]; %>
+            <% const m = TEAM_MARKS[t.no - 1] || { mark: String(t.no), label: t.no + ' 队' }; %>
             <li class="team-row">
-              <span class="team-mark" aria-hidden="true"><%= m.mark %></span>
-              <span class="sr-only"><%= m.label %></span>
+              <%# The mark and the team's count are one unit, so the count can
+                  never wrap away from the team it belongs to. 目前几人/每队几人:
+                  the left half counts everybody standing in this team, a
+                  试训/Guest place included — it holds a place at the event the
+                  same way a member does. The right half is **this team's own**
+                  number out of `event.teamSizes`, not a figure shared by the
+                  rows, so the ones carrying the remainder read one higher. The
+                  last team (the overflow, which is uncapped) can legitimately
+                  read past its own, and any team can sit over it after members
+                  withdrew — nobody is ever re-allocated. %>
+              <span class="team-head">
+                <span class="team-mark" aria-hidden="true"><%= m.mark %></span>
+                <span class="sr-only"><%= m.label %></span>
+                <span class="team-count">（<%= t.members.length %><% if (sizes.length) { %>/<%= sizes[t.no - 1] %><% } %>人）：</span>
+              </span>
               <%# One span per name rather than a joined string, so the viewer's
                   own can be marked — it is the whole question they came with.
                   The separator is written between the spans, on one line, or
@@ -222,10 +250,9 @@
          + (p.checkedInBy ? '\n代签到：' + p.checkedInBy : '')
          + (p.fine ? '\n罚款：$' + p.fine + '（' + (p.lateLabel || '未签到') + '）' : ''); %>
     <div class="roster-block mb-4">
-      <%# 已报名人数 against 人数上限. The hand-recorded 总人数 that used to sit
-          beside it is gone: the number that matters is now derived — it is this
-          count plus 试训批准人数 in the block below, which is what sizes 自动分队 —
-          so a third line would only have restated the two the page already shows. %>
+      <%# 已报名人数 against 人数上限, and nothing else: what sizes 自动分队 is this
+          count plus 试训批准人数 in the block below, so a second line here would
+          only have restated the two the page already shows. %>
       <div class="roster-head">
         <span class="roster-count">已报名人数：<%= participants.length %> / <%= event.capacity %></span>
       </div>

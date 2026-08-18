@@ -76,18 +76,16 @@ CREATE TABLE IF NOT EXISTS gsffc.events (
   description TEXT,
   capacity    INTEGER NOT NULL DEFAULT 0,
   checkin_radius INTEGER NOT NULL DEFAULT 10,
-  -- NOTE: there used to be a `total_headcount` column here — 总人数（包含试训、
-  -- guest）, typed in by an admin, which is what 自动分队 sized its teams from.
-  -- It is **gone**: the team size is now 已报名人数 + 试训批准人数, derived from
-  -- `event_signups` and `event_guests` on every read (db.js `teamSize`), so
-  -- there is no longer a hand-maintained number that can fall out of agreement
-  -- with the roster it was supposed to describe.
-  -- Nothing in the app reads or writes the column any more, so a database that
-  -- still has it keeps working — dropping it is a manual
-  -- `ALTER TABLE gsffc.events DROP COLUMN total_headcount;`, which this file
-  -- deliberately does not do for you (it is written to be safe to re-apply, and
-  -- a destructive DDL has no business in that).
   visibility  TEXT NOT NULL DEFAULT 'ALL',
+  -- 自动分队: how many teams this event is split into — 2, 3 or 4, picked by the
+  -- admin on the event form. It used to be a hardcoded 3 in db.js, which meant a
+  -- 板凳 on an event the club was playing 4-a-side. The team **size** is still
+  -- derived on every read (ceil((已报名人数 + 试训批准人数) / team_count)); only
+  -- the count itself is stored, because it is a decision rather than a
+  -- consequence. 3 is the default, i.e. what every pre-existing row reads as.
+  -- db.js `TEAM_COUNTS`/`normalizeTeamCount` is what keeps the column to the
+  -- three values; the CHECK below is the backstop.
+  team_count  SMALLINT NOT NULL DEFAULT 3,
   CONSTRAINT events_end_after_start CHECK (end_at > start_at),
   CONSTRAINT events_visibility_shape CHECK (visibility IN ('ALL', 'ADMIN') OR visibility LIKE '%@%')
 );
@@ -125,13 +123,14 @@ CREATE TABLE IF NOT EXISTS gsffc.event_signups (
 -- passed the geofence. No foreign key, for the same reason `email` has none.
 --
 -- `team_no` is 自动分队: the team this member was allocated to at the moment they
--- checked in, 1..3. The allocation is *random*, which is exactly why it is the
--- one part of the feature that has to be stored — the team count (always 3) and
--- the team size (ceil((已报名人数 + 试训批准人数) / 3), i.e. the confirmed rows in
--- `event_signups` plus the approved ones in `event_guests`) are derived on every
+-- checked in, 1..`events.team_count`. The allocation is *random*, which is
+-- exactly why it is the one part of the feature that has to be stored — the team
+-- size (ceil((已报名人数 + 试训批准人数) / team_count), i.e. the confirmed rows in
+-- `event_signups` plus the approved ones in `event_guests`) is derived on every
 -- read and never written, so the teams re-size as members sign up or withdraw and
 -- as guests are approved, and no column can drift out of agreement with the
--- numbers it was computed from. Same arrangement as 迟到罚款.
+-- numbers it was computed from. Same arrangement as 迟到罚款. (The count itself is
+-- stored, on the event, because it is the admin's decision — see there.)
 --
 -- It rides on the check-in rather than living in a table of its own because a
 -- member is allocated *by arriving*: withdrawing, 清空报名, deleting the member
@@ -159,10 +158,9 @@ CREATE INDEX IF NOT EXISTS event_signups_queue_idx
 
 -- 试训/Guest. A trialist or a guest has no account, so they can never sign up,
 -- never check in and never appear on the roster — this table is the only record
--- of them, and it is what 自动分队 now sizes the guest places from. Before it
--- existed their number was *guessed*, as 总人数 − 人数上限, and they were labelled
--- A/B/C; the approved rows here replace that derivation entirely. The placement
--- rule they are fed into is unchanged — see db.js `eventGuests`.
+-- of them, and it is what 自动分队 sizes the guest places from — the **approved**
+-- rows are the places, and the placement rule they are fed into is db.js
+-- `eventGuests`.
 --
 -- A row has two lives, and `approved_at` is which one it is in:
 --   NULL     — a pending request. Any member may submit as many as they like,

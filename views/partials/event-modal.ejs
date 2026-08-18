@@ -29,6 +29,11 @@
   const memberOptions = visibilityMode === 'MEMBER' && !memberList.some(m => m.email === visibility)
     ? [{ email: visibility, name: visibility }, ...memberList]
     : memberList;
+
+  // 队伍数量 — 2, 3 or 4, defaulting to 3 both for a new event and for one
+  // written before the column existed. Same `selected`-in-the-markup arrangement
+  // as 可见范围 above, and for the same reason.
+  const teamCount = (isEdit && Number(formEvent.teamCount)) || 3;
 %>
 <div class="modal fade" id="event-modal" tabindex="-1" role="dialog" aria-labelledby="event-modal-title" aria-hidden="true">
   <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable" role="document">
@@ -83,14 +88,27 @@
           </div>
 
           <%# 人数上限 is the number of app places the waitlist is measured
-              against, and it is now the only headcount on this form: 总人数 —
-              typed in by hand and used to size 自动分队 — is gone, because the
-              team size is derived from 已报名人数 + 试训批准人数 instead. It takes
-              the full width now that nothing shares its row. %>
-          <div class="form-group field-inline-sm">
-            <label for="ev-capacity">人数上限</label>
-            <input class="form-control" id="ev-capacity" name="capacity" type="number" min="0" step="1" required
-                   value="<%= isEdit ? formEvent.capacity : 22 %>">
+              against, and the only headcount on this form — the team size is
+              not typed in at all, it is derived from 已报名人数 + 试训批准人数.
+              队伍数量 shares its row: it is the other half of the same decision —
+              how many places there are, and how many ways they are split. It is
+              a `<select>` with `selected` in the markup rather than set from
+              script, because `form.reset()` is what restores the prefill (a copy
+              keeps the original's team count, which is what a copy is for). %>
+          <div class="form-row">
+            <div class="form-group field-inline-sm col-sm-6">
+              <label for="ev-capacity">人数上限</label>
+              <input class="form-control" id="ev-capacity" name="capacity" type="number" min="0" step="1" required
+                     value="<%= isEdit ? formEvent.capacity : 22 %>">
+            </div>
+            <div class="form-group field-inline-sm col-sm-6">
+              <label for="ev-team-count">队伍数量</label>
+              <select class="form-control" id="ev-team-count" name="teamCount">
+                <% [2, 3, 4].forEach(n => { %>
+                  <option value="<%= n %>" <%= teamCount === n ? 'selected' : '' %>><%= n %> 队</option>
+                <% }) %>
+              </select>
+            </div>
           </div>
 
           <%# 可见范围: who the event exists for at all. 指定成员 reveals the member
@@ -588,7 +606,10 @@
         endAt: f.end.value.slice(0, 16),
         location: f.location.value.trim(),
         description: f.description.value.trim(),
-        capacity: Number(f.capacity.value)
+        capacity: Number(f.capacity.value),
+        // The <select> only offers 2/3/4; the server normalizes it again and
+        // refuses anything else, so a hand-crafted body can't reach the column.
+        teamCount: Number(f.teamCount.value)
       };
       if (!body.title) return fail('请填写活动名称');
       if (!DT_RE.test(body.startAt)) return fail('请选择开始日期和时间');
