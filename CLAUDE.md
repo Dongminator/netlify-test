@@ -61,8 +61,10 @@ runs it, `db.js` only opens a pool and queries. Consequences to remember:
   for a fresh database, and again as `ALTER TABLE … ADD COLUMN IF NOT EXISTS` for one that already has
   the table. Both forms are
   idempotent, so the file stays safe to run as a whole; anything that still can't be expressed that way
-  (a CHECK, which has no `IF NOT EXISTS` and needs a `DO $$ … EXCEPTION WHEN duplicate_object $$` block)
-  is applied by hand in `psql` at the same time. **`events.visibility` predates this and is missing its
+  (a CHECK, which has no `IF NOT EXISTS`) goes in wrapped in a
+  `DO $$ … EXCEPTION WHEN duplicate_object $$` block, which makes it idempotent too — that is how
+  `event_guests.status` went in, column and CHECK together, and it is preferred over the older habit of
+  applying such a CHECK by hand in `psql`. **`events.visibility` predates this and is missing its
   `ALTER`** — a database created before that column has to have it added by hand.
   A whole new table needs neither form — `CREATE TABLE IF NOT EXISTS` covers both cases, constraints
   included, which is how `gsffc.event_guests` went in.
@@ -147,7 +149,8 @@ held by a CHECK: `'ALL'` (every signed-in member — the default, and what every
 as), `'ADMIN'` (administrators only), or **a single member's lowercase email**. `db.normalizeVisibility`
 is what coerces a submitted value into one of the three — uppercasing the keywords, lowercasing an
 address, throwing on anything else — and it is called inside `createEvent`/`updateEvent`, so nothing can
-reach the column unnormalized. `db.canSeeEvent(event, {email, role})` is **the** rule, and
+reach the column unnormalized. `db.canSeeEvent(event, {email, role})` is the **column's** half of the rule (see 报名开放时间 below for
+the other half, and `canSee` in [server.js](server.js), which is what every route actually calls), and
 **an `ADMIN` always sees everything**: without that, an event could be published for one member and then
 be uneditable and undeletable by anyone, including the admin who made it.
 
@@ -184,15 +187,55 @@ restricted event shows an amber `.cal-event.is-restricted` chip with a lock on t
 `badge-warning` beside the title on its page; both come from `visibilityLabel()` in server.js, which is
 null for an ordinary event, so the lock only ever appears to someone allowed to see the event anyway.
 
-**No headcount is stored on an event but 人数上限.** The team size is `已报名人数 + 试训批准人数`,
-derived on every read from `event_signups` and `event_guests` (`db.teamSizes`, below), and 人数上限
-(`capacity`) caps the roster without sizing anything. A hand-typed number describing a roster the app
+**报名开放时间 — 20:00 club time on the Wednesday before the event — is the other half of who may see
+it.** It is a club-wide rule, not a per-event field: the club opens every week's signups at the same
+moment, so there is nothing for an admin to fill in and nothing that can be set wrong.
+`signupOpensAt(event)` in [server.js](server.js) is the instant — the **last** Wednesday 20:00 strictly
+before kick-off, so it always falls inside the week running up to the event (a Saturday match opens on
+the Wednesday three days earlier; a Wednesday match at 19:00 opens a full week ahead rather than an hour
+after it has finished). The date arithmetic is done in UTC on the **wall-clock date** and only the
+finished wall clock goes through `clubEpoch`, so it lands on 20:00 in the club's zone on both sides of a
+DST change. `SIGNUP_OPEN_DOW`/`SIGNUP_OPEN_TIME` are the two constants; an unparseable `startAt` answers
+NaN and the gate falls back to open, like every other one here.
+
+**Before it, the event exists for administrators only** — that is what gives them the window to arrange
+the week's 试训 before the club is let at the places. `canSee(event, user)` in [server.js](server.js) is
+therefore **the** rule now and every route calls it in place of `db.canSeeEvent`: the column's rule
+first, then an `ADMIN` short-circuit, then `signupOpen(event)`. A member is refused exactly as they are
+refused a restricted event — the calendar and `/api/events` filter it out before anything is built from
+it, and every route handing one out 404s rather than 403ing. A new route that hands out an event must
+call `canSee`, never `db.canSeeEvent` directly.
+
+**报名 itself opens at the same instant, for everybody — administrators included.** The pre-open window
+is for arranging 试训, not for taking places ahead of the club, so `POST /event/:id/signup` carries its
+own `signupOpen` gate and redirects back unchanged, the same shape as the frozen 清空报名; the page
+renders the reason (⏳ 报名 … 开放) where the button would be. What an admin *can* do in that window is
+审核/添加 试训/Guest, which is not gated on it at all — those routes are admin-only and never went
+through `canSeeEvent` — and a guest added then is **confirmed on the spot**, since no member has taken a
+place yet. On the calendar the pre-open state rides in the same `visibilityNote` the restricted lock
+uses (`visibilityLabel` and `signupNote` joined with ` · `), so it needs no second affordance; on the
+event page it is its own amber badge beside the title.
+
+**No headcount is stored on an event but 总人数.** The team size is `已报名人数 + 试训人数`,
+derived on every read from `event_signups` and `event_guests` (`db.teamSizes`, below), and 总人数
+(`capacity`) caps the event without sizing anything. A hand-typed number describing a roster the app
 already holds can only ever fall out of agreement with it, while the two numbers the club genuinely
 maintains — the signups and the approved guests — already add up to the answer.
 
+**总人数 counts every body coming, member and 试训 alike** — it used to be 人数上限, a members-only
+number that the approved guests sat on top of, so an event set to 22 with three 试训 actually held 25.
+It now caps the two together: `db.countPlaces` is the one count (`confirmed event_signups` +
+`confirmed approved event_guests`), `rowToEvent` exposes it as **`event.placesTaken`/`event.placesLeft`**,
+and every "is there room?" test in db.js reads it — `signUpForEvent`, `approveEventGuest`,
+`addEventGuest` and `promoteFromWaitlist` alike. The consequence the club asked for follows on its own:
+**approving a 试训 takes a place off the members**, because there is only ever one pool of places.
+`MAX_EVENT_GUESTS` (3) is a *different* cap counting a different thing — how many 试训/Guest may be
+approved **at all**, waitlisted ones included — so the fourth guest is refused outright while the third
+can perfectly well be approved onto the waitlist of an event the members have already filled.
+
 **队伍数量 is the admin's, and it is the one part of a team that is stored on the event.**
 `events.team_count` is **2, 3 or 4** (default 3, which is what every row written before the column reads
-as), picked from a `<select>` on the event form beside 人数上限. It used to be a hardcoded `TEAM_COUNT = 3`
+as), picked from a `<select>` on the event form beside 总人数. It used to be a hardcoded `TEAM_COUNT = 3`
 in db.js, which meant a 板凳 on an event the club was playing four-a-side. `db.TEAM_COUNTS` is the list,
 `db.normalizeTeamCount` is what nothing gets past — it throws on a stated value that is not one of the
 three and answers the default for an absent one, the same shape as `normalizeVisibility`, and it is
@@ -224,10 +267,11 @@ arrivals are already going. **It used to be one number for every team — the to
 a size no uneven split can be true of: 9 in four teams gave four teams of 3, i.e. room for 12, so the
 page promised places the event did not have and 方片 was left standing empty while 梅花 filled.
 **Who is coming is
-已报名人数 + 试训批准人数**: the event's confirmed `event_signups` plus its approved `event_guests`. The
-**waitlist is deliberately not in it** — a waitlisted member has no place at the event yet, so they are
-nobody's teammate until they are promoted, at which point the size grows on its own. `capacity`
-(人数上限) has **no part** in it either: it caps the roster, it does not size the teams.
+已报名人数 + 试训人数**: the event's confirmed `event_signups` plus its **confirmed** approved
+`event_guests`. The **waitlist is deliberately not in it**, and that now cuts both ways — neither a
+waitlisted member nor a waitlisted 试训 has a place at the event yet, so neither is anybody's teammate
+until they are promoted, at which point the size grows on its own. `capacity` (总人数) has **no part**
+in it either: it caps the event, it does not size the teams.
 
 `teamSizes` answers `null` only for an event with nobody on it at all — no signups and no approved guest
 — and the first signup makes it `[1, 0, 0]`. A team's number is legitimately **0** when fewer people are
@@ -312,8 +356,8 @@ why the placement **cannot** be a draw the way a member's is: it is derived on e
 draw would move between renders *and* disagree with the room `pickTeam` left. 申请时间 and arithmetic are
 what make both callers reach the same answer from the same rows — `eventGuests` sorts its input itself
 rather than trusting the order the query handed it, since `getEventGuests` orders the approved half by
-`approved_at` (已批准 then 待批准, the order the page renders the two lists in) and `pickTeam` reads its
-own.
+`approved_at` and the pending half 试训-first (已批准 then 待批准, the order the page renders the two
+lists in — see 待批准 order below) and `pickTeam` reads its own.
 
 Because the guests' teams depend on those same counts, **`pickTeam` derives them itself** rather than
 being handed them: it takes `(client, eventId, event)` — the row `withEventLock` hands over, which is
@@ -334,6 +378,19 @@ nothing recorded. `rowToSignup` exposes the column as `roster[].team`, and `rowT
 `event.teamCount` arrays of emails, an empty team being an
 empty array) as read-only views beside `signups`/`waitlist`/`checkins`. Both check-in routes return
 `team` in their JSON.
+
+**An approved 试训/Guest can be on the waitlist.** 总人数 counts them like a member, so
+`event_guests` carries the same `status`/`promoted_at` pair `event_signups` does and
+`approveEventGuest`/`addEventGuest` decide it under the lock against `db.countPlaces` — confirmed when
+there is room, `WAITLIST` when the event is already full, served from the one queue in `approved_at`
+order (see Waitlist above). The column is meaningful **only on an approved row**; a pending request
+holds nothing, and `unapproveEventGuest` resets it along with the approval so a later 批准 decides it
+afresh. Only the **confirmed** half sizes the teams and is placed into them (`event.confirmedGuests`,
+which is what `rowToEvent` hands `eventGuests` and what `pickTeam` selects) — a queueing guest is not at
+the event yet. `event.approvedGuests` is still **both** halves, because that is what `MAX_EVENT_GUESTS`
+counts. In the sidebar the block now holds three lists — 已批准, 候补 (each row carrying its place in
+the shared queue, in the same blue as the roster grid's `.roster-queue` badge), then 待批准 — and
+`guestView` hangs **`waitlisted`** off every row for both renderers, the same arrangement as `isTrial`.
 
 **试训/Guest is one table with two lives, and `approved_at` is which one a row is in.**
 `gsffc.event_guests` is the club's record of the people coming who have no account — the thing 自动分队
@@ -415,6 +472,15 @@ across several. 申请 applies `canSeeEvent` and 404s like 报名 does; 取消 d
 into the message. 申请 carries the extra `guestRequestsClosed` gate; 取消 deliberately does **not**, since
 a pending request holds no place and cancelling one at the pitch changes no team.
 
+**申请试训/Guest is switched off for the moment.** `GUEST_REQUEST_ENABLED` at the top of
+[event.ejs](views/event.ejs) is `false`, and it is the only thing that changed: the member's action row
+and the request dialog are not rendered, so a guest gets onto an event only through an admin's
+审核/添加. Everything below still describes the feature as written and comes back with the flag —
+`canRequestGuest`, `guestRequestClosedNote` and the `?guest=` banner are all still computed, the
+sidebar still lists 已批准/待批准, a member can still 取消 a pending row of their own, and
+`POST /event/:id/guests` is **not** gated on the flag (it is a UI decision about which entry point is
+offered, not a refusal — the same shape as an admin never seeing 申请).
+
 **The two roles get two different buttons, and never both.** A member sees **申请试训/Guest**; an admin
 sees **审核/添加 试训/Guest** and no 申请 row at all — they do not queue for their own approval, so 添加
 inside the review dialog is their way in, and the label names both halves of what that dialog does. It
@@ -450,6 +516,22 @@ which list this is, and repeating it per row cost a third of the width in a ~300
 the row it belongs to. Only the *second* `.guest-section-sm` takes the dashed rule
 (`.guest-section-sm + .guest-section-sm`), so whichever list is rendered first runs straight on from the
 head instead of stranding a rule under it.
+
+**待批准 is ordered 试训 first, then Guest, each half oldest request first** — `getEventGuests`'s
+`ORDER BY`, so the sidebar list and the review dialog cannot disagree about the queue. A trialist is
+somebody the club is looking at; a guest is somebody's friend; there are three places and they are
+handed out by hand, so the kind outranks 申请时间 and 申请时间 only breaks the tie inside a kind. The
+priority is guarded on `approved_at IS NULL`: **已批准 keeps its 批准时间 order**, since an approved row
+is a place at the event and re-sorting that half by type would move who was decided first. It changes
+**nothing about 自动分队** — `eventGuests` re-sorts the approved rows into 申请时间 order itself, exactly
+so that the display order cannot reach the teams.
+
+**The two kinds are told apart by the chip's colour, not only its text**: `.guest-type.is-trial` is
+amber (the calendar's restricted-event amber) and semibold, an ordinary Guest keeps a plain grey chip.
+Same size and same position in the row either way, so the list still reads as one column and the 试训
+rows the sort put at the top are the ones that also look heavier. `guestView` hangs **`isTrial`** off
+every row for it — a flag, not a `type === 'TRIAL'` in two renderers — since the sidebar's EJS and the
+review dialog's `row()` both pick the class from it.
 
 The block is rendered **only when there is something in it** — an approved guest or a pending request —
 the same test the waitlist uses. An event with no 试训/Guest at all is the ordinary case, and a heading
@@ -519,16 +601,29 @@ in the ~300px sidebar and full width on a phone alike.
 
 **Waitlist.** `event_signups.status` is `SIGNED_UP` or `WAITLIST`, constrained by a CHECK and mirrored by
 `db.SIGNED_UP`/`db.WAITLIST`. Signing up for a full event is never refused: `signUpForEvent` counts the
-confirmed rows under the lock and records a `WAITLIST` row instead, and the route redirects to
-`?joined=waitlist` so the page can say so. `promoteFromWaitlist` is the only way back up — one
-`UPDATE … FROM (SELECT … ORDER BY signed_up_at LIMIT room)`, so the database decides who is next rather
-than a read-then-write — and it is called from **every path that can free a place**: a withdrawal
-(`withdrawFromEvent`, and only when the leaver held a confirmed place), an admin raising `capacity`
-(`updateEvent`, in the same transaction as the edit), and a member being deleted (`deleteUser`). A new
-path that frees a place must call it too, holding the event lock. `promoted_at` records the moment and
-stays NULL for a signup that was confirmed from the start. Lowering `capacity` deliberately demotes
-**nobody**: a confirmed place is never taken back, so the event just sits over capacity until enough
-members withdraw. Ordering everywhere is `signed_up_at` — the waitlist is served strictly first-come.
+places under the lock and records a `WAITLIST` row instead, and the route redirects to
+`?joined=waitlist` so the page can say so. `promoteFromWaitlist` is the only way back up, and it is
+called from **every path that can free a place**: a withdrawal (`withdrawFromEvent`, and only when the
+leaver held a confirmed place), an admin 移出-ing a confirmed 试训 (`unapproveEventGuest`), 清空报名
+(`clearEventRoster`), an admin raising `capacity` (`updateEvent`, in the same transaction as the edit),
+and a member being deleted (`deleteUser`). A new path that frees a place must call it too, holding the
+event lock. `promoted_at` records the moment and stays NULL for a row that was confirmed from the start.
+Lowering `capacity` deliberately demotes **nobody**: a confirmed place is never taken back, so the event
+just sits over capacity until enough members withdraw.
+
+**There is one queue, not two.** 总人数 counts a 试训 exactly like a member, so `event_guests` carries
+the **same** `status`/`promoted_at` pair as `event_signups` and an approved guest either holds one of
+the event's places or queues for one beside the members. `promoteFromWaitlist` therefore serves a
+`UNION ALL` of the two tables ordered by **when each row took its place in line** — `signed_up_at` for a
+signup, `approved_at` for a guest (the moment an admin put them in, which is that guest's 报名时间) —
+cut to the room available in one SELECT, with the two UPDATEs keyed by exactly the rows it returned. The
+ordering is the database's, so who is next cannot be made stale by a concurrent write; it returns
+`[{kind, email, guestId}]` rather than the bare emails it used to, and nothing reads that but the caller
+that logs it. The two halves are still *shown* in two lists (the roster is an avatar grid and a guest
+has no account, so no picture), which is why `queuePlaces(event)` in [server.js](server.js) numbers them
+**across both** — two lists each counting from 1 would have two different people believing they are
+next. Both `/event/:id` and `guestPayload` go through it, so the page and the admin dialog cannot
+disagree about the queue.
 
 **Calendar view.** `/calendar` renders a month grid built server-side by `buildMonthGrid` in
 [server.js](server.js#L118): weeks start on **Sunday** (leftmost column), always 6 rows so the card keeps
@@ -591,7 +686,7 @@ dropdown: the modal body is a scroll container and would clip an overlay. It is 
 `.field-inline-sm` wrapper around label+input, not a child — under `sm` that class makes its children one
 flex row and the list would join the line.
 
-**人数上限 shares its `col-sm-6` row with 队伍数量**, the two halves of one decision — how many places
+**总人数 shares its `col-sm-6` row with 队伍数量**, the two halves of one decision — how many places
 there are, and how many ways they are split. 队伍数量 is a `<select>` of 2/3/4 carrying `selected` in
 the **markup**, not from script, like both 可见范围 `<select>`s and for the same reason: `form.reset()`
 in `setMode` is what restores the prefill, so a 复制 keeps the original's team count. 地点 still has the
@@ -635,6 +730,13 @@ Creating navigates to `/calendar?month=<new event's month>&created=1`, and that 
 green banner the page's script removes after 5 seconds; editing just reloads the event page. Either way
 the result comes from one fresh server render instead of being patched into the DOM. `validateEvent` is
 shared by both routes; extend it rather than adding a second set of checks.
+
+**The roster head states 总人数, not just the members.** `已报名人数：N 人 · 试训 G 人` on the first
+line and `总人数 T / capacity · 剩余 R 个名额` on the second (`.roster-total`, smaller and softer) — the
+members' number alone could never say how much room is left once a 试训 holds a place, and 剩余名额 is
+the half somebody deciding whether to sign up is actually reading. The 试训 clause only renders when
+there is one. The signup button keys off `full` (`event.placesLeft <= 0`), not a members-only count, so
+加入候补名单 appears at the moment the event really is full.
 
 **Signup roster.** The 报名名单 block is an avatar grid (`.roster` in [public/css/event.css](public/css/event.css)),
 not a list: each member is their `profilePhoto` — or the gravatar fallback — over their name, and the

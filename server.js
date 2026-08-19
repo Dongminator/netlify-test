@@ -200,14 +200,40 @@ function guestView(guest, nameOf) {
     id: guest.id,
     type: guest.type,
     typeLabel: guestTypeLabel(guest.type),
+    // Which of the two kinds this is, as a flag rather than a keyword comparison
+    // in two renderers: the chip is louder for a 试训 than for a Guest, and both
+    // the page and the review dialog decide that from this one field.
+    isTrial: guest.type === db.GUEST_TRIAL,
     name: guest.name,
     requestedBy: guest.requestedBy,
     requestedByName: nameOf(guest.requestedBy),
     requestedAt: formatStamp(guest.requestedAt),
     approvedByName: guest.approvedBy ? nameOf(guest.approvedBy) : '',
     approvedAt: formatStamp(guest.approvedAt),
-    approved: !!guest.approvedAt
+    approved: !!guest.approvedAt,
+    // An approved row holds one of the event's 总人数 places — or queues for one
+    // beside the members, which is what this says. Meaningless on a pending row,
+    // which holds nothing either way.
+    waitlisted: !!guest.approvedAt && guest.status === db.WAITLIST,
+    promotedAt: formatStamp(guest.promotedAt)
   };
+}
+
+// The event's **one** waitlist, as a Map of key -> 1-based place: `m:<email>`
+// for a member, `g:<id>` for a 试训/Guest. 总人数 counts the two kinds of body
+// together, so a waitlisted member and a waitlisted guest are queueing for the
+// same place and db.js promotes them strictly by when each joined the queue —
+// `signed_up_at` for a signup, `approved_at` for a guest. They are *shown* in
+// two different lists (the roster is an avatar grid and a guest has no account,
+// so no picture), which is exactly why the numbering has to be worked out across
+// both of them in one place: two lists each counting from 1 would have two
+// different people believing they are next.
+function queuePlaces(event) {
+  return new Map([
+    ...event.roster.filter(s => s.status === db.WAITLIST)
+      .map(s => ({ key: `m:${s.email}`, at: s.signedUpAt })),
+    ...event.guestWaitlist.map(g => ({ key: `g:${g.id}`, at: g.approvedAt }))
+  ].sort((a, b) => new Date(a.at) - new Date(b.at)).map((q, i) => [q.key, i + 1]));
 }
 
 // What the admin review dialog re-renders itself from after every action, so the
@@ -217,13 +243,27 @@ function guestView(guest, nameOf) {
 function guestPayload(event, users) {
   const byEmail = new Map(users.map(u => [u.email, u]));
   const nameOf = email => (byEmail.get(email) || {}).name || email;
-  const all = event.guestRequests.map(g => guestView(g, nameOf));
+  // `place` rides on every row for the same reason `waitlisted` does: the dialog
+  // redraws itself from this payload after every action, so anything the first
+  // paint shows has to be in here too or a 候补 number would vanish on approval.
+  const places = queuePlaces(event);
+  const all = event.guestRequests.map(g => ({
+    ...guestView(g, nameOf),
+    place: places.get(`g:${g.id}`) || 0
+  }));
   const approved = all.filter(g => g.approved);
   return {
     approved,
     pending: all.filter(g => !g.approved),
     max: db.MAX_EVENT_GUESTS,
-    full: approved.length >= db.MAX_EVENT_GUESTS
+    full: approved.length >= db.MAX_EVENT_GUESTS,
+    // 总人数, so the dialog can say what an approval will actually do: with no
+    // places left the next 批准/添加 lands the guest on the waitlist rather than
+    // at the event. `max` above is the other cap and counts a different thing —
+    // how many 试训/Guest may be approved at all, waitlisted ones included.
+    capacity: event.capacity,
+    placesTaken: event.placesTaken,
+    placesLeft: event.placesLeft
   };
 }
 
@@ -300,6 +340,69 @@ function hasEnded(event) {
 // so the button and the route agree on when it opens.
 const CHECKIN_LEAD_MS = 60 * 60 * 1000;
 const checkinOpensAt = event => clubEpoch(event.startAt) - CHECKIN_LEAD_MS;
+
+// 报名开放时间 — **20:00 club time on the Wednesday before the event**, and it is
+// a club-wide rule rather than a per-event field: the club opens every week's
+// signups at the same moment, so there is nothing for an admin to fill in and
+// nothing that can be set wrong. Until it arrives the event **exists for
+// administrators only** (see `canSee`), which is what gives them the window to
+// arrange the week's 试训 before the club is let at the places.
+//
+// The instant is the last one of its kind strictly *before* kick-off, so it is
+// always inside the week running up to the event: a Saturday match opens on the
+// Wednesday three days earlier, and a Wednesday match at 19:00 — before 20:00 —
+// opens a full week ahead rather than an hour after it has finished.
+const SIGNUP_OPEN_DOW = 3;        // Wednesday, in Date's 0 = Sunday numbering
+const SIGNUP_OPEN_TIME = '20:00'; // club wall clock, like every other event time
+
+// The event's 报名开放时间 as an epoch, or NaN when `startAt` is unparseable —
+// the same "fall back to open" every other gate takes on a malformed time.
+// The date arithmetic is done in UTC on the **wall-clock date** (never on an
+// instant), and only the finished wall clock goes through `clubEpoch`, so the
+// answer is 20:00 in the club's zone on both sides of a DST change.
+function signupOpensAt(event) {
+  const startAt = String((event && event.startAt) || '');
+  const date = startAt.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return NaN;
+  const day = new Date(Date.UTC(+date.slice(0, 4), +date.slice(5, 7) - 1, +date.slice(8, 10)));
+  // How many days back the last Wednesday is. On a Wednesday event that is
+  // today — unless kick-off is at or before 20:00, in which case today's opening
+  // would not be *before* the event and the week before is the right one.
+  let back = (day.getUTCDay() - SIGNUP_OPEN_DOW + 7) % 7;
+  if (back === 0 && startAt.slice(11, 16) <= SIGNUP_OPEN_TIME) back = 7;
+  day.setUTCDate(day.getUTCDate() - back);
+  return clubEpoch(`${day.toISOString().slice(0, 10)}T${SIGNUP_OPEN_TIME}`);
+}
+
+// Whether the club may see and sign up for this event yet. An unparseable time
+// answers "open", like every other gate here.
+function signupOpen(event) {
+  const at = signupOpensAt(event);
+  return !Number.isFinite(at) || Date.now() >= at;
+}
+
+// What the page and the calendar chip say about an event whose signups have not
+// opened yet — null once they have.
+function signupNote(event) {
+  return signupOpen(event) ? null : `报名 ${formatStamp(signupOpensAt(event))} 开放`;
+}
+
+// **The** rule for who may see an event, and the one every route calls —
+// `db.canSeeEvent` is only half of it now. The other half is time: before
+// 报名开放时间 an event belongs to the administrators, whatever its `visibility`
+// column says, so the club never sees a week's fixture until the same moment the
+// places open. An admin sees everything, as always — otherwise they could not
+// arrange the 试训 the window exists for.
+//
+// A member is refused exactly as they are refused a restricted event: the
+// calendar and `/api/events` filter it out before anything is built from it, and
+// every route handing one out 404s rather than 403ing, since a refusal would
+// confirm the event exists.
+function canSee(event, user) {
+  if (!db.canSeeEvent(event, user)) return false;
+  if (user && user.role === db.ADMIN) return true;
+  return signupOpen(event);
+}
 
 // The half of a check-in that is about *being there*: the window has to be open,
 // and the posted position has to fall inside the event's radius. Both routes go
@@ -455,7 +558,7 @@ app.get('/calendar', requireLogin, wrap(async (req, res) => {
   // Restricted events are not merely hidden from the grid — they are dropped
   // here, before anything is built out of them, so nothing downstream (a count,
   // a tooltip, the picker's map centre) can leak one.
-  const events = (await db.getEvents()).filter(e => db.canSeeEvent(e, me));
+  const events = (await db.getEvents()).filter(e => canSee(e, me));
   const today = todayStr();
   // The add-event modal's 指定成员 picker. Only admins see the modal at all, so
   // only they pay for the extra query.
@@ -466,9 +569,16 @@ app.get('/calendar', requireLogin, wrap(async (req, res) => {
     const m = members.find(u => u.email === email);
     return m ? m.name : '';
   };
-  // What the chip's lock icon and tooltip say. Set on the event objects
-  // themselves because `buildMonthGrid` hands the very same ones to the grid.
-  for (const e of events) e.visibilityNote = visibilityLabel(e, nameOf);
+  // What the chip's lock icon and tooltip say — the two things that can narrow
+  // an event to administrators, in one string: its `visibility` column, and
+  // 报名开放时间 not having arrived yet. Only an admin can be looking at a
+  // pre-open event at all (the filter above is what makes that true), so the
+  // lock only ever appears to somebody allowed to see it anyway. Set on the
+  // event objects themselves, because `buildMonthGrid` hands the very same ones
+  // to the grid.
+  for (const e of events) {
+    e.visibilityNote = [visibilityLabel(e, nameOf), signupNote(e)].filter(Boolean).join(' · ') || null;
+  }
 
   // ?month=YYYY-MM drives the grid; anything malformed falls back to this month.
   // "This month" comes out of the club-local date, not the process's own clock —
@@ -528,7 +638,7 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
   // exists, which is the one thing a hidden event must not do.
   const mineRow = byEmail.get(req.session.user.email);
   const me = await viewer(req, mineRow ? mineRow.role : db.MEMBER);
-  if (!db.canSeeEvent(event, me)) return res.status(404).render('404', { title: 'Not Found' });
+  if (!canSee(event, me)) return res.status(404).render('404', { title: 'Not Found' });
   // Needed before the roster is built, not just at render: whether the event is
   // over is what turns "has not checked in yet" into "did not turn up".
   const isPast = hasEnded(event);
@@ -570,7 +680,11 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     };
   };
   const participants = event.roster.filter(s => s.status === db.SIGNED_UP).map(toParticipant);
-  const waitlist = event.roster.filter(s => s.status === db.WAITLIST).map(toParticipant);
+  // 候补名单 is **one queue** — see `queuePlaces`. The member's place in it is
+  // therefore not this list's own index: a 试训 queueing ahead of them counts.
+  const queuePlace = queuePlaces(event);
+  const waitlist = event.roster.filter(s => s.status === db.WAITLIST)
+    .map((s, i) => ({ ...toParticipant(s, i), place: queuePlace.get(`m:${s.email}`) || i + 1 }));
   const mine = event.roster.find(s => s.email === req.session.user.email) || null;
   // 自动分队 — visible only to somebody who has actually turned up. The teams are
   // read at the pitch, by the people about to play, so checking in is the price
@@ -627,9 +741,17 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
   const nameOf = email => (byEmail.get(email) || {}).name || email;
   const guests = event.guestRequests.map(g => ({
     ...guestView(g, nameOf),
-    isMine: g.requestedBy === req.session.user.email
+    isMine: g.requestedBy === req.session.user.email,
+    // Their place in the one queue above, for a waitlisted one; 0 otherwise.
+    place: queuePlace.get(`g:${g.id}`) || 0
   }));
+  // `approvedGuests` is still **both halves** — it is what the MAX_EVENT_GUESTS
+  // count is against, and that cap is on approving at all, not on holding a
+  // place. The two lists under it are what the sidebar renders: the guests who
+  // hold one of the event's 总人数 places, and the ones queueing for one.
   const approvedGuests = guests.filter(g => g.approved);
+  const confirmedGuests = approvedGuests.filter(g => !g.waitlisted);
+  const waitlistedGuests = approvedGuests.filter(g => g.waitlisted);
   const pendingGuests = guests.filter(g => !g.approved);
   const myGuests = guests.filter(g => g.isMine);
   res.render('event', {
@@ -645,7 +767,7 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     // 1-based place in the queue, so a waitlisted member is told how many are
     // ahead of them rather than just that they are waiting.
     myPlace: mine && mine.status === db.WAITLIST
-      ? waitlist.findIndex(p => p.email === mine.email) + 1
+      ? (queuePlace.get(`m:${mine.email}`) || 0)
       : 0,
     checkedIn: !!mine && !!mine.checkedInAt,
     myCheckinAt: formatStamp(mine && mine.checkedInAt),
@@ -655,11 +777,25 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     teamsLocked: !!allocated.length && !seesTeams,
     // Set by the redirect from POST /event/:id/signup when the event was full.
     joinedWaitlist: req.query.joined === 'waitlist',
-    // 试训/Guest — both lists public, and each row carrying `isMine`.
+    // 试训/Guest — every list public, and each row carrying `isMine`.
     approvedGuests,
+    confirmedGuests,
+    waitlistedGuests,
     pendingGuests,
     myGuests,
     maxGuests: db.MAX_EVENT_GUESTS,
+    // 总人数: `capacity` is the whole event's headcount — members **and** 试训 —
+    // so these are what the roster head and the signup button read. Approving a
+    // 试训 really does take a place off the members, which is the point.
+    placesTaken: event.placesTaken,
+    placesLeft: event.placesLeft,
+    full: event.placesLeft <= 0,
+    // 报名开放时间 — 20:00 on the Wednesday before. Before it, only an admin is
+    // looking at this page at all, and nobody may sign up yet; the note is what
+    // says so instead of the button.
+    signupOpen: signupOpen(event),
+    signupOpensAt: signupOpensAt(event),
+    signupNote: signupNote(event),
     guestTypes: GUEST_TYPE_OPTIONS,
     // Whether **this** viewer may still submit a request, which is the single
     // test the 申请试训/Guest button renders on. Four things close it, and the
@@ -730,9 +866,15 @@ app.post('/event/:id/signup', requireLogin, wrap(async (req, res) => {
   // such check — a member whose event was restricted after they signed up must
   // still be able to take their place back out of it.
   const event = await db.getEvent(req.params.id);
-  if (!event || !db.canSeeEvent(event, await viewer(req))) {
+  if (!event || !canSee(event, await viewer(req))) {
     return res.status(404).render('404', { title: 'Not Found' });
   }
+  // 报名 opens for **everybody** at 20:00 on the Wednesday before, administrators
+  // included: the window before it is for arranging 试训, not for taking places
+  // ahead of the club. A member cannot even see the event by then, so this
+  // catches an admin's own button and a hand-crafted POST, and lands back on the
+  // event unchanged — the same shape as the frozen 清空报名.
+  if (!signupOpen(event)) return res.redirect(`/event/${req.params.id}`);
   const result = await db.signUpForEvent(req.params.id, req.session.user.email);
   if (!result) return res.status(404).render('404', { title: 'Not Found' });
   const waitlisted = result.created && result.status === db.WAITLIST;
@@ -760,7 +902,7 @@ app.post('/event/:id/guests', requireLogin, wrap(async (req, res) => {
   // An event you may not see is one you may not ask for a place at, and it
   // answers as a missing one — same rule as the signup route.
   const event = await db.getEvent(req.params.id);
-  if (!event || !db.canSeeEvent(event, await viewer(req))) {
+  if (!event || !canSee(event, await viewer(req))) {
     return res.status(404).render('404', { title: 'Not Found' });
   }
   // Frozen once the event has ended, and closed an hour before kick-off when the
@@ -914,7 +1056,7 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
   const event = await db.getEvent(req.params.id);
   if (!event) return res.status(404).json({ ok: false, message: '活动不存在' });
   // Same answer as a missing event, for the same reason as the signup route.
-  if (!db.canSeeEvent(event, await viewer(req))) {
+  if (!canSee(event, await viewer(req))) {
     return res.status(404).json({ ok: false, message: '活动不存在' });
   }
   if (!event.coords) return res.status(400).json({ ok: false, message: '该活动为线上活动，无需到场签到' });
@@ -1314,13 +1456,13 @@ async function checkVisibilityTarget(visibility) {
 // JSON API — no delete; creating is admin-only, editing is not (POC)
 app.get('/api/events', requireLoginApi, wrap(async (req, res) => {
   const me = await viewer(req);
-  res.json((await db.getEvents()).filter(e => db.canSeeEvent(e, me)));
+  res.json((await db.getEvents()).filter(e => canSee(e, me)));
 }));
 
 app.get('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
   const me = await viewer(req);
   const event = await db.getEvent(req.params.id);
-  if (!event || !db.canSeeEvent(event, me)) {
+  if (!event || !canSee(event, me)) {
     return res.status(404).json({ ok: false, message: '活动不存在' });
   }
   res.json(event);
@@ -1328,7 +1470,7 @@ app.get('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
 
 app.put('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
   const event = await db.getEvent(req.params.id);
-  if (!event || !db.canSeeEvent(event, await viewer(req))) {
+  if (!event || !canSee(event, await viewer(req))) {
     return res.status(404).json({ ok: false, message: '活动不存在' });
   }
   // A finished event is fixed: it exists and can be read, so this is a 400 and

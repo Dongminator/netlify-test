@@ -123,6 +123,18 @@
   display: block;
 }
 
+/* 总人数 — the event's whole headcount, members and 试训 together, on its own
+   line under the members' count. It is the second-order number (the first line
+   is who is on the grid below it), so it is smaller and softer; 剩余名额 rides
+   with it because that is the half somebody deciding whether to sign up is
+   actually reading. */
+.roster-total {
+  display: block;
+  margin-top: .125rem;
+  font-size: .8125rem;
+  color: var(--gsf-ink-faint);
+}
+
 .roster {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(4rem, 1fr));
@@ -359,15 +371,27 @@
 }
 
 /* 试训 or Guest — a chip rather than parentheses, because the two kinds are read
-   against each other down a list and the name is what should carry the weight. */
+   against each other down a list and the name is what should carry the weight.
+   The two kinds are **not** the same weight: a 试训 is somebody the club is
+   looking at and is what the 待批准 queue is sorted to put first, so its chip is
+   the amber one (the same amber a restricted event's chip carries on the
+   calendar) and reads as a mark, while a Guest keeps a plain grey chip that says
+   only which kind it is. Colour is the whole difference — the chip's size and
+   position are identical, so a list of them still reads as one column. */
 .guest-type {
   flex: none;
   padding: 0 .375rem;
   border-radius: 999px;
-  background: var(--gsf-50);
-  color: var(--gsf-700);
+  background: #eef1f5;
+  color: var(--gsf-ink-soft);
   font-size: .75rem;
   line-height: 1.5;
+}
+
+.guest-type.is-trial {
+  background: #fff3d1;
+  color: #8a6100;
+  font-weight: 600;
 }
 
 .guest-meta {
@@ -405,6 +429,22 @@
 
 .guest-sub-count {
   color: var(--gsf-ink-faint);
+}
+
+/* An approved 试训/Guest waiting for a place rather than holding one. It is the
+   same fact the roster grid's `.roster-queue` badge carries for a member, and it
+   is deliberately the same blue: the queue is one queue, so 候补 3 in this list
+   and 3 on the avatar grid are the same position in the same line. A chip rather
+   than a corner badge, because this list has no avatar to hang one on. */
+.guest-queue {
+  flex: none;
+  padding: 0 .375rem;
+  border-radius: 999px;
+  background: var(--gsf-600);
+  color: #fff;
+  font-size: .6875rem;
+  font-weight: 600;
+  line-height: 1.5;
 }
 
 /* The cancel form must not add layout — it is only there to carry the POST. */

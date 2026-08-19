@@ -74,13 +74,18 @@ CREATE TABLE IF NOT EXISTS gsffc.events (
   lat         DOUBLE PRECISION,
   lng         DOUBLE PRECISION,
   description TEXT,
+  -- 总人数: the whole event's headcount — the members who sign up **and** the
+  -- approved 试训/Guest, counted together. It is not a members-only 人数上限 any
+  -- more: approving a guest takes one of these places, so the room left for
+  -- members shrinks by itself, and everybody who arrives after the last place is
+  -- gone — member or 试训 alike — is recorded on the waitlist.
   capacity    INTEGER NOT NULL DEFAULT 0,
   checkin_radius INTEGER NOT NULL DEFAULT 10,
   visibility  TEXT NOT NULL DEFAULT 'ALL',
   -- 自动分队: how many teams this event is split into — 2, 3 or 4, picked by the
   -- admin on the event form. It used to be a hardcoded 3 in db.js, which meant a
   -- 板凳 on an event the club was playing 4-a-side. The team **size** is still
-  -- derived on every read (ceil((已报名人数 + 试训批准人数) / team_count)); only
+  -- derived on every read (已报名人数 + 试训人数 split team_count ways); only
   -- the count itself is stored, because it is a decision rather than a
   -- consequence. 3 is the default, i.e. what every pre-existing row reads as.
   -- db.js `TEAM_COUNTS`/`normalizeTeamCount` is what keeps the column to the
@@ -125,9 +130,9 @@ CREATE TABLE IF NOT EXISTS gsffc.event_signups (
 -- `team_no` is 自动分队: the team this member was allocated to at the moment they
 -- checked in, 1..`events.team_count`. The allocation is *random*, which is
 -- exactly why it is the one part of the feature that has to be stored — the team
--- size (ceil((已报名人数 + 试训批准人数) / team_count), i.e. the confirmed rows in
--- `event_signups` plus the approved ones in `event_guests`) is derived on every
--- read and never written, so the teams re-size as members sign up or withdraw and
+-- size (已报名人数 + 试训人数 split team_count ways, i.e. the confirmed rows in
+-- `event_signups` plus the confirmed approved ones in `event_guests`) is derived
+-- on every read and never written, so the teams re-size as members sign up or withdraw and
 -- as guests are approved, and no column can drift out of agreement with the
 -- numbers it was computed from. Same arrangement as 迟到罚款. (The count itself is
 -- stored, on the event, because it is the admin's decision — see there.)
@@ -182,6 +187,18 @@ CREATE INDEX IF NOT EXISTS event_signups_queue_idx
 -- member's **pending** rows only (nobody could cancel them otherwise) and leaves
 -- the approved ones with the address on them, exactly as `checked_in_by` keeps a
 -- deleted admin's.
+--
+-- `status` is the same pair of keywords as `event_signups.status` and means the
+-- same thing, because `events.capacity` is 总人数 — one number for every body
+-- coming, a 试训 exactly like a member. An approved row therefore either holds
+-- one of those places (SIGNED_UP) or queues for one (WAITLIST), and the two
+-- tables share **one** waitlist, served strictly by when each row joined it:
+-- `signed_up_at` for a signup, `approved_at` for a guest. It is meaningful only
+-- once the row is approved — a pending request holds nothing — and db.js resets
+-- it along with the approval when an admin 移出s one. `promoted_at` is when the
+-- queue reached them, NULL for a guest confirmed from the start, the mirror of
+-- `event_signups.promoted_at`. Rows written before the column existed read as
+-- SIGNED_UP, which is what they were.
 CREATE TABLE IF NOT EXISTS gsffc.event_guests (
   id           BIGSERIAL PRIMARY KEY,
   event_id     TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,
@@ -191,8 +208,14 @@ CREATE TABLE IF NOT EXISTS gsffc.event_guests (
   requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   approved_by  TEXT,
   approved_at  TIMESTAMPTZ,
+  status       TEXT NOT NULL DEFAULT 'SIGNED_UP',
+  promoted_at  TIMESTAMPTZ,
   CONSTRAINT event_guests_approval_pair
-    CHECK ((approved_by IS NULL) = (approved_at IS NULL))
+    CHECK ((approved_by IS NULL) = (approved_at IS NULL)),
+  -- Named, and named the same as the ALTER below adds: on a fresh database this
+  -- one is created here and the ALTER then raises duplicate_object and is
+  -- swallowed, so re-running the file never leaves two copies of the same rule.
+  CONSTRAINT event_guests_status_shape CHECK (status IN ('SIGNED_UP', 'WAITLIST'))
 );
 
 -- Both hot reads are one event's rows split into approved and pending, each half
@@ -200,3 +223,8 @@ CREATE TABLE IF NOT EXISTS gsffc.event_guests (
 -- handed out down the teams.
 CREATE INDEX IF NOT EXISTS event_guests_event_idx
   ON gsffc.event_guests (event_id, approved_at, requested_at);
+
+-- Counting the confirmed guests against 总人数, and picking the next queueing one
+-- off the shared waitlist, are the two reads every roster write now makes.
+CREATE INDEX IF NOT EXISTS event_guests_queue_idx
+  ON gsffc.event_guests (event_id, status, approved_at);

@@ -1,5 +1,14 @@
 <%- include('partials/header') %>
 <% const isAdmin = user && user.role === 'ADMIN'; %>
+<%# 申请试训/Guest is **hidden for now**, and this flag is the whole of it: the
+    member's own entry point — the button in the action stack and the dialog it
+    opens — is not rendered while it is false, so the only way a guest gets onto
+    an event is an admin's 审核/添加. Nothing else is switched off: the sidebar
+    still lists 已批准/待批准, a member can still 取消 a pending request of their
+    own, and POST /event/:id/guests is untouched (this is which entry point is
+    offered, not a refusal — the same shape as an admin not seeing 申请). Set it
+    back to true and both come back exactly as they were. %>
+<% const GUEST_REQUEST_ENABLED = false; %>
 <%# 代签到 — who an admin at the pitch could still check in. Offered only while
     there is somebody left to check in, the event can still be checked into, and
     it has a point to be near; empty for everyone else, which is what hides both
@@ -57,6 +66,13 @@
         rather than that it is hidden. %>
     <% if (visibilityNote) { %>
       <span class="badge badge-warning"><i class="fas fa-lock mr-1" aria-hidden="true"></i><%= visibilityNote %></span>
+    <% } %>
+    <%# 报名开放时间 — 20:00 on the Wednesday before the event. Until then the
+        event is administrators-only, so only an admin ever sees this badge, and
+        it says the moment the club will be let in rather than that they are
+        shut out. %>
+    <% if (signupNote) { %>
+      <span class="badge badge-warning"><i class="fas fa-clock mr-1" aria-hidden="true"></i><%= signupNote %></span>
     <% } %>
   </h3>
 </div>
@@ -190,7 +206,7 @@
            4: [{ mark: '♠️', label: '黑桃' }, { mark: '♥️', label: '红桃' },
                { mark: '♣️', label: '梅花' }, { mark: '♦️', label: '方片' }]
          })[event.teamCount] || []; %>
-      <%# 每队几人 is `event.teamSizes` — 已报名人数 + 试训批准人数 split 队伍数量
+      <%# 每队几人 is `event.teamSizes` — 已报名人数 + 试训人数 split 队伍数量
           ways, **one number per team** because the split is rarely even (9 in
           four teams is 3/2/2/2). Derived on every read, so it moves as members
           sign up or guests are approved. The heading states the one number when
@@ -250,11 +266,15 @@
          + (p.checkedInBy ? '\n代签到：' + p.checkedInBy : '')
          + (p.fine ? '\n罚款：$' + p.fine + '（' + (p.lateLabel || '未签到') + '）' : ''); %>
     <div class="roster-block mb-4">
-      <%# 已报名人数 against 人数上限, and nothing else: what sizes 自动分队 is this
-          count plus 试训批准人数 in the block below, so a second line here would
-          only have restated the two the page already shows. %>
+      <%# 已报名人数 and 试训人数 on one line, the 总人数 they add up to on the
+          next: `capacity` counts the two kinds of body together now, so the
+          members' number on its own would never say how much room is left.
+          剩余名额 is the one an arriving member is actually looking for, which
+          is why it is stated rather than left to be worked out. The 试训 half
+          only appears when there is one — most events have none. %>
       <div class="roster-head">
-        <span class="roster-count">已报名人数：<%= participants.length %> / <%= event.capacity %></span>
+        <span class="roster-count">已报名人数：<%= participants.length %> 人<% if (confirmedGuests.length) { %> · 试训 <%= confirmedGuests.length %> 人<% } %></span>
+        <span class="roster-total">总人数 <%= placesTaken %> / <%= event.capacity %> · <% if (placesLeft) { %>剩余 <%= placesLeft %> 个名额<% } else { %>名额已满<% } %></span>
       </div>
       <% if (participants.length === 0) { %>
         <p class="text-muted mb-0">还没有人报名</p>
@@ -364,7 +384,15 @@
       <% const guestRow = g => { %>
         <li class="guest-item">
           <span class="guest-name"><%= g.name %></span>
-          <span class="guest-type"><%= g.typeLabel %></span>
+          <span class="guest-type <%= g.isTrial ? 'is-trial' : 'is-guest' %>"><%= g.typeLabel %></span>
+          <%# An approved 试训/Guest can be queueing rather than playing: 总人数
+              counts them like a member, so one approved into a full event joins
+              the same waitlist and carries its place in it — numbered across
+              both lists, so 候补 3 here and 3 on the roster grid are never two
+              different people. %>
+          <% if (g.waitlisted && g.place) { %>
+            <span class="guest-queue">候补 <%= g.place %></span>
+          <% } %>
           <span class="guest-meta">由 <%= g.requestedByName %> 提交</span>
           <% if (g.isMine && !g.approved && !isPast) { %>
             <form class="guest-cancel" method="POST"
@@ -376,11 +404,25 @@
         </li>
       <% }; %>
 
-      <% if (approvedGuests.length) { %>
+      <%# Three lists, in the order they matter: who holds a place, who is
+          queueing for one, and whose request an admin has not decided yet. The
+          middle one is new — an approved 试训/Guest is a body counted against
+          总人数, so approving one into a full event queues it exactly as a
+          member's signup is queued, rather than overfilling the event. %>
+      <% if (confirmedGuests.length) { %>
         <div class="guest-section-sm">
           <div class="guest-sub-head is-approved">已批准</div>
           <ul class="guest-list">
-            <% approvedGuests.forEach(guestRow) %>
+            <% confirmedGuests.forEach(guestRow) %>
+          </ul>
+        </div>
+      <% } %>
+
+      <% if (waitlistedGuests.length) { %>
+        <div class="guest-section-sm">
+          <div class="guest-sub-head">候补<span class="guest-sub-count">（<%= waitlistedGuests.length %>）</span></div>
+          <ul class="guest-list">
+            <% waitlistedGuests.forEach(guestRow) %>
           </ul>
         </div>
       <% } %>
@@ -428,7 +470,17 @@
         </form>
         <span class="text-warning event-action-note">⏳ 你在候补名单第 <%= myPlace %> 位</span>
       </div>
-    <% } else if (participants.length >= event.capacity) { %>
+    <% } else if (!signupOpen) { %>
+      <%# 报名 has not opened yet — 20:00 on the Wednesday before the event —
+          so there is no button for anybody, an admin included: the window
+          before it is for arranging 试训, not for taking places ahead of the
+          club. The route refuses it too; this only decides what renders. %>
+      <div class="event-action">
+        <span class="event-action-note text-muted">⏳ <%= signupNote %>，届时全体会员可见并可报名</span>
+      </div>
+    <% } else if (full) { %>
+      <%# 名额已满 counts 试训 as well as members — 总人数 is one number for every
+          body coming — and the waitlist is one queue for both. %>
       <div class="event-action">
         <form method="POST" action="/event/<%= event.id %>/signup">
           <button class="btn btn-warning btn-action" type="submit">加入候补名单</button>
@@ -454,7 +506,7 @@
         told *why* rather than left looking for something that vanished — the same
         shape as 取消报名 disappearing after a check-in. The note always states how
         many places are left, so nobody submits into a full event without knowing. %>
-    <% if (!isAdmin) { %>
+    <% if (GUEST_REQUEST_ENABLED && !isAdmin) { %>
       <div class="event-action">
         <% if (canRequestGuest) { %>
           <button class="btn btn-outline-secondary btn-action" type="button"
@@ -506,7 +558,7 @@
           <i class="fas fa-user-friends mr-1" aria-hidden="true"></i>审核/添加 试训/Guest
         </button>
         <span class="event-action-note text-muted">
-          已批准 <%= approvedGuests.length %> / <%= maxGuests %><% if (pendingGuests.length) { %> · 待批准 <%= pendingGuests.length %><% } %>
+          已批准 <%= approvedGuests.length %> / <%= maxGuests %><% if (waitlistedGuests.length) { %>（候补 <%= waitlistedGuests.length %>）<% } %><% if (pendingGuests.length) { %> · 待批准 <%= pendingGuests.length %><% } %> · <% if (placesLeft) { %>剩余 <%= placesLeft %> 个名额<% } else { %>总人数已满<% } %>
         </span>
       </div>
     <% } %>
@@ -556,7 +608,7 @@
     raises the banner at the top. The two fields are all there is to say about a
     guest; who asked and when are the server's to record.
     Rendered on exactly the test that renders the button that opens it. %>
-<% if (canRequestGuest) { %>
+<% if (GUEST_REQUEST_ENABLED && canRequestGuest) { %>
   <div class="modal fade" id="guest-request-modal" tabindex="-1" role="dialog"
        aria-labelledby="guest-request-title" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered" role="document">
@@ -657,7 +709,8 @@
          approved: approvedGuests,
          pending: pendingGuests,
          max: maxGuests,
-         full: approvedGuests.length >= maxGuests
+         full: approvedGuests.length >= maxGuests,
+         placesLeft: placesLeft
        }) %>">
     <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable" role="document">
       <div class="modal-content">
@@ -773,10 +826,19 @@
         name.className = 'guest-name';
         name.textContent = g.name;
         var type = document.createElement('span');
-        type.className = 'guest-type';
+        type.className = 'guest-type ' + (g.isTrial ? 'is-trial' : 'is-guest');
         type.textContent = g.typeLabel;
         head.appendChild(name);
         head.appendChild(type);
+        // An approved row that is queueing rather than playing: 总人数 counts a
+        // 试训 like a member, so one approved into a full event waits in the
+        // same queue and carries its place in it.
+        if (g.waitlisted && g.place) {
+          var queue = document.createElement('span');
+          queue.className = 'guest-queue';
+          queue.textContent = '候补 ' + g.place;
+          head.appendChild(queue);
+        }
         var meta = document.createElement('div');
         meta.className = 'guest-review-meta';
         meta.textContent = isApproved
@@ -842,9 +904,16 @@
         fill(approvedList, state.approved, true, '还没有已批准的试训/Guest');
         fill(pendingList, state.pending, false, '没有待批准的申请');
         addBtn.disabled = busy || state.full;
+        // Two different "满" — the 试训/Guest cap, which blocks the button, and
+        // the event's own 总人数, which does not: an approval into a full event
+        // is still recorded, as a place in the waitlist. Saying which one it is
+        // is the whole point of the line.
         addHint.textContent = state.full
           ? '名额已满（最多 ' + state.max + ' 位），请先移出一位再添加'
-          : '直接添加的试训/Guest 立即占用名额，记录为由所选申请人提交、由你批准。';
+          : state.placesLeft > 0
+            ? '直接添加的试训/Guest 立即占用名额（剩余 ' + state.placesLeft
+              + ' 个），记录为由所选申请人提交、由你批准。'
+            : '活动总人数已满：现在添加或批准的试训/Guest 会进入候补名单，按时间顺序自动补位。';
       }
 
       function post(url, body, okMessage) {

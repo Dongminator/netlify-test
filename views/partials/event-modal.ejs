@@ -87,9 +87,12 @@
             </div>
           </div>
 
-          <%# 人数上限 is the number of app places the waitlist is measured
-              against, and the only headcount on this form — the team size is
-              not typed in at all, it is derived from 已报名人数 + 试训批准人数.
+          <%# 总人数 is **every body coming** — the members who sign up and the
+              approved 试训/Guest together — and it is the number the waitlist is
+              measured against, so approving a 试训 takes a place off the members
+              rather than adding one. It is still the only headcount on this
+              form: the team size is not typed in at all, it is derived from
+              已报名人数 + 试训人数.
               队伍数量 shares its row: it is the other half of the same decision —
               how many places there are, and how many ways they are split. It is
               a `<select>` with `selected` in the markup rather than set from
@@ -97,9 +100,10 @@
               keeps the original's team count, which is what a copy is for). %>
           <div class="form-row">
             <div class="form-group field-inline-sm col-sm-6">
-              <label for="ev-capacity">人数上限</label>
+              <label for="ev-capacity">总人数</label>
               <input class="form-control" id="ev-capacity" name="capacity" type="number" min="0" step="1" required
-                     value="<%= isEdit ? formEvent.capacity : 22 %>">
+                     title="含试训/Guest 的总名额，报名满后自动进入候补名单"
+                     value="<%= isEdit ? formEvent.capacity : 27 %>">
             </div>
             <div class="form-group field-inline-sm col-sm-6">
               <label for="ev-team-count">队伍数量</label>
