@@ -143,11 +143,11 @@ function requireSelfOrAdminApi(req, res, next) {
   return requireAdminApi(req, res, next);
 }
 
-// The viewer, in the shape `db.canSeeEvent` wants — with the role re-read from
-// the database rather than taken from the session's copy, which can be 30 days
-// stale. Event visibility is an access decision, so it gets the same treatment
-// as `adminGuard`: one query, and the session copy refreshed along the way so a
-// demoted admin stops seeing admin-only events at once.
+// The viewer, in the shape `canSee` wants — with the role re-read from the
+// database rather than taken from the session's copy, which can be 30 days
+// stale. Who may see an event is an access decision, so it gets the same
+// treatment as `adminGuard`: one query, and the session copy refreshed along the
+// way so a demoted admin stops seeing pre-open events at once.
 // Pass `role` when the caller has already read the row (the event page reads
 // every member to build its roster, so the viewer's fresh row is already in
 // hand) and this costs nothing at all.
@@ -161,40 +161,20 @@ async function viewer(req, role) {
   return { email, role };
 }
 
-// What an event's visibility says, for the badge on its page and the calendar
-// chip's tooltip. `nameOf` turns the stored address into the member's name when
-// there is an account behind it. Null for an ordinary, everyone-can-see event.
-function visibilityLabel(event, nameOf) {
-  if (!event || !event.visibility || event.visibility === db.VISIBLE_ALL) return null;
-  if (event.visibility === db.VISIBLE_ADMIN) return '仅管理员可见';
-  const name = nameOf ? nameOf(event.visibility) : '';
-  return `仅 ${name || event.visibility} 可见`;
-}
-
 // 试训/Guest. db.js stores the two kinds as keywords, like every other enum in
 // the schema; these are what they are called on the page, and the options the
-// 申请/添加 forms offer. A third kind means adding to `db.GUEST_TYPES` and here.
+// admin's 添加 form offers. A third kind means adding to `db.GUEST_TYPES` and here.
 const GUEST_TYPE_LABELS = { [db.GUEST_TRIAL]: '试训', [db.GUEST_GUEST]: 'Guest' };
 const guestTypeLabel = type => GUEST_TYPE_LABELS[type] || type;
 const GUEST_TYPE_OPTIONS = db.GUEST_TYPES.map(t => ({ value: t, label: guestTypeLabel(t) }));
 
-// 申请试训/Guest closes when the check-in window opens, an hour before kick-off.
-// By then the club is setting off for the pitch and 自动分队 is about to start
-// drawing teams around the approved guests, so a new name arriving is too late to
-// be useful and would re-size the teams under the people already at the field.
-// An admin is **not** subject to it: 审核/添加 试训/Guest stays open until the event
-// ends, because a guest who actually turns up still has to be let in.
-// A malformed `startAt` makes `checkinOpensAt` NaN, and the comparison is then
-// false — the same "fall back to open" every other gate takes.
-const guestRequestsClosed = event => Date.now() >= checkinOpensAt(event);
-
-// One 试训/Guest as the page and the review dialog read it: the keyword turned
+// One 试训/Guest as the page and the 添加/移出 dialog read it: the keyword turned
 // into its label, both addresses turned into names, both timestamps formatted.
 // `nameOf` is the caller's lookup over the member rows it has already read — an
 // address with no account behind it (a deleted member) is handed back as-is,
-// which is still truer than dropping who asked for the guest.
-// `approved` is `approved_at` being set, the one thing that separates a place at
-// the event from a request waiting for an admin.
+// which is still truer than dropping who the guest is coming through.
+// Every row is a place at the event: only an admin can add one, and 移出 deletes
+// it outright, so there is no pending state left to distinguish.
 function guestView(guest, nameOf) {
   return {
     id: guest.id,
@@ -208,13 +188,12 @@ function guestView(guest, nameOf) {
     requestedBy: guest.requestedBy,
     requestedByName: nameOf(guest.requestedBy),
     requestedAt: formatStamp(guest.requestedAt),
-    approvedByName: guest.approvedBy ? nameOf(guest.approvedBy) : '',
-    approvedAt: formatStamp(guest.approvedAt),
-    approved: !!guest.approvedAt,
-    // An approved row holds one of the event's 总人数 places — or queues for one
-    // beside the members, which is what this says. Meaningless on a pending row,
-    // which holds nothing either way.
-    waitlisted: !!guest.approvedAt && guest.status === db.WAITLIST,
+    // 添加人/添加时间 — the admin who put the guest on the event.
+    addedByName: guest.addedBy ? nameOf(guest.addedBy) : '',
+    addedAt: formatStamp(guest.addedAt),
+    // The row holds one of the event's 总人数 places — or queues for one beside
+    // the members, which is what this says.
+    waitlisted: guest.status === db.WAITLIST,
     promotedAt: formatStamp(guest.promotedAt)
   };
 }
@@ -223,7 +202,7 @@ function guestView(guest, nameOf) {
 // for a member, `g:<id>` for a 试训/Guest. 总人数 counts the two kinds of body
 // together, so a waitlisted member and a waitlisted guest are queueing for the
 // same place and db.js promotes them strictly by when each joined the queue —
-// `signed_up_at` for a signup, `approved_at` for a guest. They are *shown* in
+// `signed_up_at` for a signup, 添加时间 for a guest. They are *shown* in
 // two different lists (the roster is an avatar grid and a guest has no account,
 // so no picture), which is exactly why the numbering has to be worked out across
 // both of them in one place: two lists each counting from 1 would have two
@@ -232,35 +211,33 @@ function queuePlaces(event) {
   return new Map([
     ...event.roster.filter(s => s.status === db.WAITLIST)
       .map(s => ({ key: `m:${s.email}`, at: s.signedUpAt })),
-    ...event.guestWaitlist.map(g => ({ key: `g:${g.id}`, at: g.approvedAt }))
+    ...event.guestWaitlist.map(g => ({ key: `g:${g.id}`, at: g.addedAt }))
   ].sort((a, b) => new Date(a.at) - new Date(b.at)).map((q, i) => [q.key, i + 1]));
 }
 
-// What the admin review dialog re-renders itself from after every action, so the
-// two lists it shows come from one fresh read rather than from patching a row
-// across them. The same `guestView` the page render uses, so a field added for
-// one is in the other.
+// What the admin 添加/移出 dialog re-renders itself from after every action, so
+// the list it shows comes from one fresh read rather than from patching a row
+// into or out of it. The same `guestView` the page render uses, so a field added
+// for one is in the other.
 function guestPayload(event, users) {
   const byEmail = new Map(users.map(u => [u.email, u]));
   const nameOf = email => (byEmail.get(email) || {}).name || email;
   // `place` rides on every row for the same reason `waitlisted` does: the dialog
   // redraws itself from this payload after every action, so anything the first
-  // paint shows has to be in here too or a 候补 number would vanish on approval.
+  // paint shows has to be in here too or a 候补 number would vanish on an 添加.
   const places = queuePlaces(event);
-  const all = event.guestRequests.map(g => ({
+  const guests = event.guestList.map(g => ({
     ...guestView(g, nameOf),
     place: places.get(`g:${g.id}`) || 0
   }));
-  const approved = all.filter(g => g.approved);
   return {
-    approved,
-    pending: all.filter(g => !g.approved),
+    guests,
     max: db.MAX_EVENT_GUESTS,
-    full: approved.length >= db.MAX_EVENT_GUESTS,
-    // 总人数, so the dialog can say what an approval will actually do: with no
-    // places left the next 批准/添加 lands the guest on the waitlist rather than
-    // at the event. `max` above is the other cap and counts a different thing —
-    // how many 试训/Guest may be approved at all, waitlisted ones included.
+    full: guests.length >= db.MAX_EVENT_GUESTS,
+    // 总人数, so the dialog can say what an 添加 will actually do: with no places
+    // left the next one lands the guest on the waitlist rather than at the event.
+    // `max` above is the other cap and counts a different thing — how many
+    // 试训/Guest the event may have at all, waitlisted ones included.
     capacity: event.capacity,
     placesTaken: event.placesTaken,
     placesLeft: event.placesLeft
@@ -387,20 +364,21 @@ function signupNote(event) {
   return signupOpen(event) ? null : `报名 ${formatStamp(signupOpensAt(event))} 开放`;
 }
 
-// **The** rule for who may see an event, and the one every route calls —
-// `db.canSeeEvent` is only half of it now. The other half is time: before
-// 报名开放时间 an event belongs to the administrators, whatever its `visibility`
-// column says, so the club never sees a week's fixture until the same moment the
-// places open. An admin sees everything, as always — otherwise they could not
-// arrange the 试训 the window exists for.
+// **The** rule for who may see an event, and the one every route calls. It is
+// time, and nothing else: before 报名开放时间 an event belongs to the
+// administrators, so the club never sees a week's fixture until the same moment
+// the places open. An admin sees everything, as always — otherwise they could
+// not arrange the 试训 the window exists for.
 //
-// A member is refused exactly as they are refused a restricted event: the
-// calendar and `/api/events` filter it out before anything is built from it, and
-// every route handing one out 404s rather than 403ing, since a refusal would
-// confirm the event exists.
+// There is no per-event visibility any more: every event is open to every member
+// once its signups do, which is what the Wednesday rule was for. A member who is
+// refused is refused exactly as they are refused a missing event — the calendar
+// and `/api/events` filter it out before anything is built from it, and every
+// route handing one out 404s rather than 403ing, since a refusal would confirm
+// the event exists.
 function canSee(event, user) {
-  if (!db.canSeeEvent(event, user)) return false;
-  if (user && user.role === db.ADMIN) return true;
+  if (!event || !user || !user.email) return false;
+  if (user.role === db.ADMIN) return true;
   return signupOpen(event);
 }
 
@@ -554,30 +532,19 @@ app.get('/logout', (req, res) => {
 
 app.get('/calendar', requireLogin, wrap(async (req, res) => {
   const me = await viewer(req);
-  const isAdmin = me.role === db.ADMIN;
-  // Restricted events are not merely hidden from the grid — they are dropped
-  // here, before anything is built out of them, so nothing downstream (a count,
-  // a tooltip, the picker's map centre) can leak one.
+  // An event whose signups have not opened is not merely hidden from the grid —
+  // it is dropped here, before anything is built out of it, so nothing
+  // downstream (a count, a tooltip, the picker's map centre) can leak one.
   const events = (await db.getEvents()).filter(e => canSee(e, me));
   const today = todayStr();
-  // The add-event modal's 指定成员 picker. Only admins see the modal at all, so
-  // only they pay for the extra query.
-  const members = isAdmin
-    ? (await db.getUsers()).map(u => ({ email: u.email, name: u.name }))
-    : [];
-  const nameOf = email => {
-    const m = members.find(u => u.email === email);
-    return m ? m.name : '';
-  };
-  // What the chip's lock icon and tooltip say — the two things that can narrow
-  // an event to administrators, in one string: its `visibility` column, and
-  // 报名开放时间 not having arrived yet. Only an admin can be looking at a
-  // pre-open event at all (the filter above is what makes that true), so the
-  // lock only ever appears to somebody allowed to see it anyway. Set on the
-  // event objects themselves, because `buildMonthGrid` hands the very same ones
-  // to the grid.
+  // What the chip's lock icon and tooltip say — the one thing that can still
+  // narrow an event to administrators: 报名开放时间 not having arrived yet. Only
+  // an admin can be looking at a pre-open event at all (the filter above is what
+  // makes that true), so the lock only ever appears to somebody allowed to see
+  // the event anyway. Set on the event objects themselves, because
+  // `buildMonthGrid` hands the very same ones to the grid.
   for (const e of events) {
-    e.visibilityNote = [visibilityLabel(e, nameOf), signupNote(e)].filter(Boolean).join(' · ') || null;
+    e.signupNote = signupNote(e);
   }
 
   // ?month=YYYY-MM drives the grid; anything malformed falls back to this month.
@@ -618,9 +585,6 @@ app.get('/calendar', requireLogin, wrap(async (req, res) => {
     // back here, onto the month the deleted event was in, with ?deleted=1.
     deleted: req.query.deleted === '1',
     mapCenter,
-    // The 指定成员 options in the event modal; empty for a non-admin, who never
-    // renders the modal.
-    members,
     // What the modal's date field starts on: today when it is in view, so the
     // common case needs no picking, otherwise the 1st of the month being viewed.
     defaultDate: year === thisYear && month === thisMonth ? today : ymd(year, month, 1)
@@ -632,10 +596,10 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
   if (!event) return res.status(404).render('404', { title: 'Not Found' });
   const users = await db.getUsers();
   const byEmail = new Map(users.map(u => [u.email, u]));
-  // The viewer's own row is already in that map, so the freshly-read role the
-  // visibility rule needs costs no extra query here. An event the viewer may
-  // not see answers exactly as a missing one does — a 403 would confirm it
-  // exists, which is the one thing a hidden event must not do.
+  // The viewer's own row is already in that map, so the freshly-read role
+  // `canSee` needs costs no extra query here. An event the viewer may not see
+  // answers exactly as a missing one does — a 403 would confirm it exists, which
+  // is the one thing a hidden event must not do.
   const mineRow = byEmail.get(req.session.user.email);
   const me = await viewer(req, mineRow ? mineRow.role : db.MEMBER);
   if (!canSee(event, me)) return res.status(404).render('404', { title: 'Not Found' });
@@ -709,7 +673,7 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
   // thing they are looking for is which team they are in. Matched on **email**,
   // never on the name, since two members can share one.
   //
-  // The 试训/guest places (`event.guests`, the event's **approved** guests placed
+  // The 试训/guest places (`event.guests`, the event's **confirmed** guests placed
   // by db.js `eventGuests`) come **after** every member of the team: they are the
   // bodies who signed up through somebody else, so they sort last rather than
   // into the middle of a list somebody is scanning for their own name. The type
@@ -733,27 +697,21 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
       ]
     })).filter(t => t.no !== benchNo || t.members.length)
     : null;
-  // 试训/Guest. **Both lists are public** — who is coming and who has been asked
-  // for is the same class of fact as the roster, and a member deciding whether to
-  // ask for a place needs to see the queue they would be joining. `isMine` is
-  // what puts a 取消 on the viewer's own pending row and nobody else's; the rule
-  // behind it is the route's, not the template's.
+  // 试训/Guest. **The list is public** — who else is coming is the same class of
+  // fact as the roster. Only an admin can add or remove one, so nothing here is
+  // per-viewer any more.
   const nameOf = email => (byEmail.get(email) || {}).name || email;
-  const guests = event.guestRequests.map(g => ({
+  const guestList = event.guestList.map(g => ({
     ...guestView(g, nameOf),
-    isMine: g.requestedBy === req.session.user.email,
     // Their place in the one queue above, for a waitlisted one; 0 otherwise.
     place: queuePlace.get(`g:${g.id}`) || 0
   }));
-  // `approvedGuests` is still **both halves** — it is what the MAX_EVENT_GUESTS
-  // count is against, and that cap is on approving at all, not on holding a
-  // place. The two lists under it are what the sidebar renders: the guests who
-  // hold one of the event's 总人数 places, and the ones queueing for one.
-  const approvedGuests = guests.filter(g => g.approved);
-  const confirmedGuests = approvedGuests.filter(g => !g.waitlisted);
-  const waitlistedGuests = approvedGuests.filter(g => g.waitlisted);
-  const pendingGuests = guests.filter(g => !g.approved);
-  const myGuests = guests.filter(g => g.isMine);
+  // `guestList` is what the MAX_EVENT_GUESTS count is against — that cap is on
+  // having a 试训/Guest at all, not on holding a place. The two lists under it are
+  // what the sidebar renders: the guests holding one of the event's 总人数
+  // places, and the ones queueing for one.
+  const confirmedGuests = guestList.filter(g => !g.waitlisted);
+  const waitlistedGuests = guestList.filter(g => g.waitlisted);
   res.render('event', {
     title: event.title,
     event,
@@ -777,12 +735,10 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     teamsLocked: !!allocated.length && !seesTeams,
     // Set by the redirect from POST /event/:id/signup when the event was full.
     joinedWaitlist: req.query.joined === 'waitlist',
-    // 试训/Guest — every list public, and each row carrying `isMine`.
-    approvedGuests,
+    // 试训/Guest — public, and admin-managed: the page only reads it.
+    guestList,
     confirmedGuests,
     waitlistedGuests,
-    pendingGuests,
-    myGuests,
     maxGuests: db.MAX_EVENT_GUESTS,
     // 总人数: `capacity` is the whole event's headcount — members **and** 试训 —
     // so these are what the roster head and the signup button read. Approving a
@@ -797,31 +753,6 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     signupOpensAt: signupOpensAt(event),
     signupNote: signupNote(event),
     guestTypes: GUEST_TYPE_OPTIONS,
-    // Whether **this** viewer may still submit a request, which is the single
-    // test the 申请试训/Guest button renders on. Four things close it, and the
-    // route applies the first three: the event is over, the check-in window has
-    // opened (guests are settled before people set off for the pitch — the teams
-    // are being drawn by then), or the member already has a request on this
-    // event, since it is one per member.
-    // The fourth is **being an admin**: an admin does not queue for their own
-    // approval, they use 添加 in the review dialog, so 申请 is a member's button
-    // and 审核/添加 is theirs. It is not a *refusal* — the route would still take
-    // an admin's request, and db.js applies the same one-per-member rule to it —
-    // it is only which of the two entry points they are offered.
-    // `canRequestGuest` is rendering only.
-    canRequestGuest: !isPast && !guestRequestsClosed(event)
-      && !myGuests.length && me.role !== db.ADMIN,
-    // Which of the three member-facing reasons it is, so the row says why instead
-    // of just losing its button. Empty for an admin, whose row is the 审核/添加
-    // one instead.
-    guestRequestClosedNote: me.role === db.ADMIN ? ''
-      : myGuests.length ? '每人每场活动限申请 1 位'
-        : guestRequestsClosed(event) ? '签到已开放，不能再申请试训/Guest' : '',
-    // Raised by the redirect from POST /event/:id/guests. Matched against a fixed
-    // pair rather than passed through, so the banner's text is the page's and
-    // nothing arbitrary can be reflected into it from the query string.
-    guestNote: ['requested', 'invalid', 'duplicate'].includes(req.query.guest)
-      ? req.query.guest : '',
     isPast,
     // The 罚款 panel, which exists only on a finished event: the fines are not
     // final until nobody can still arrive. Null before that, so the template
@@ -846,12 +777,7 @@ app.get('/event/:id', requireLogin, wrap(async (req, res) => {
     eventStartsAt: clubEpoch(event.startAt),
     checkinClosesAt: clubEpoch(event.endAt),
     serverNow: Date.now(),
-    // Non-null only for a restricted event — the badge beside the title.
-    visibilityNote: visibilityLabel(event, email => {
-      const u = byEmail.get(email);
-      return u ? u.name : '';
-    }),
-    // Options for the 指定成员 picker in the admin edit modal.
+    // Options for the 申请人 picker in the admin's 添加试训/Guest dialog.
     members: me.role === db.ADMIN ? users.map(u => ({ email: u.email, name: u.name })) : []
   });
 }));
@@ -892,70 +818,17 @@ app.post('/event/:id/withdraw', requireLogin, wrap(async (req, res) => {
   res.redirect(`/event/${req.params.id}`);
 }));
 
-// 申请试训/Guest — a member asking for a place for somebody who has no account.
-// A form POST with a redirect, like 报名/取消报名, rather than the fetch the admin
-// dialog uses: it is one shot and the page behind it changes.
-// Uncapped, deliberately: what is limited to `db.MAX_EVENT_GUESTS` is the
-// **approval**, so a member can keep asking and an admin decides. Frozen once the
-// event has ended, like every other write to it.
-app.post('/event/:id/guests', requireLogin, wrap(async (req, res) => {
-  // An event you may not see is one you may not ask for a place at, and it
-  // answers as a missing one — same rule as the signup route.
-  const event = await db.getEvent(req.params.id);
-  if (!event || !canSee(event, await viewer(req))) {
-    return res.status(404).render('404', { title: 'Not Found' });
-  }
-  // Frozen once the event has ended, and closed an hour before kick-off when the
-  // check-in window opens — the button is gone from the page by then, so this
-  // catches a hand-crafted POST and lands back on the event unchanged, the same
-  // shape as the frozen 清空报名.
-  if (hasEnded(event) || guestRequestsClosed(event)) {
-    return res.redirect(`/event/${req.params.id}`);
-  }
-  let result;
-  try {
-    result = await db.requestEventGuest(req.params.id, {
-      type: req.body.type,
-      name: req.body.name,
-      requestedBy: req.session.user.email
-    });
-  } catch (err) {
-    // `normalizeGuestType`/`normalizeGuestName` refused it. The form marks the
-    // name required and caps its length, so this is a hand-crafted POST.
-    return res.redirect(`/event/${req.params.id}?guest=invalid`);
-  }
-  if (!result) return res.status(404).render('404', { title: 'Not Found' });
-  // One per member per event. The button is not rendered once they have one, so
-  // this is a double submit or a hand-crafted POST — it says so rather than
-  // silently doing nothing, since the member did ask for something.
-  if (!result.ok) return res.redirect(`/event/${req.params.id}?guest=duplicate`);
-  res.redirect(`/event/${req.params.id}?guest=requested`);
-}));
-
-// 取消试训/Guest 申请 — the member taking their own **pending** request back.
-// Carries no `canSeeEvent` check, for the same reason 退出报名 doesn't: a member
-// whose event was restricted after they asked must still be able to withdraw the
-// request. db.js refuses somebody else's row and an already-approved one, and
-// this lands back on the event unchanged either way — the page has no 取消 button
-// in those cases, so reaching them means a hand-crafted POST.
-app.post('/event/:id/guests/:guestId/cancel', requireLogin, wrap(async (req, res) => {
-  const guestId = Number(req.params.guestId);
-  if (Number.isInteger(guestId)) {
-    await db.cancelEventGuest(req.params.id, guestId, req.session.user.email);
-  }
-  res.redirect(`/event/${req.params.id}`);
-}));
-
-// The three admin 试训/Guest actions behind the 审核/添加 试训/Guest dialog. They answer
-// JSON and each one hands back the event's **whole** refreshed guest payload, so
-// the dialog re-renders both of its lists from one fresh read instead of moving a
-// row between them by hand — an approval changes the pending list, the approved
-// list and how many places are left, all at once. Admin-only and frozen on a
-// finished event, like every other write to it.
+// The two admin 试训/Guest actions behind the 添加/移出 试训/Guest dialog — the
+// only way a guest gets onto an event or off it. They answer JSON and each one
+// hands back the event's **whole** refreshed guest payload, so the dialog
+// re-renders its list from one fresh read instead of moving a row by hand: an
+// 添加 or a 移出 changes the list, how many of the three places are used and how
+// many of the event's 总人数 places are left, all at once. Admin-only and frozen
+// on a finished event, like every other write to it.
 // `action` returns { ok, reason } from db.js, or null for "no such event".
 function guestAction(action) {
   return wrap(async (req, res) => {
-    // No `canSeeEvent`, like every other admin-only route: an admin sees every
+    // No `canSee`, like every other admin-only route: an admin sees every
     // event, so the rule could only ever pass.
     const event = await db.getEvent(req.params.id);
     if (!event) return res.status(404).json({ ok: false, message: '活动不存在' });
@@ -972,7 +845,7 @@ function guestAction(action) {
     if (!result.ok) {
       const message = result.reason === 'full'
         ? `试训/Guest 名额已满（最多 ${db.MAX_EVENT_GUESTS} 位），请先移出一位`
-        : '该试训/Guest 申请不存在';
+        : '该试训/Guest 不存在';
       return res.status(400).json({ ok: false, message });
     }
     // Re-read rather than patching the event object in hand: the payload is what
@@ -985,17 +858,17 @@ function guestAction(action) {
 
 const guestIdOf = req => {
   const id = Number(req.params.guestId);
-  if (!Number.isInteger(id)) throw new Error('该试训/Guest 申请不存在');
+  if (!Number.isInteger(id)) throw new Error('该试训/Guest 不存在');
   return id;
 };
 
-// 添加试训/Guest — the direct path, with no member request behind it. The row is
-// written already approved, so it takes one of the same places an approval does.
+// 直接添加试训/Guest — the admin's only entry point, and the guest's: a member
+// cannot ask for one. The row is a place the moment it is written.
 // `requestedBy` is the 申请人 the dialog asks for — the member the guest is coming
-// through, defaulting to the admin doing the adding. The address is checked the
-// way `checkVisibilityTarget` checks a restricted event's: it carries no foreign
-// key, so a typo would otherwise record a guest as submitted by nobody, and the
-// sidebar would render the raw address where a member's name belongs.
+// through, defaulting to the admin doing the adding. The address is checked
+// because it carries no foreign key: a typo would otherwise record a guest as
+// submitted by nobody, and the sidebar would render the raw address where a
+// member's name belongs.
 app.post('/api/events/:id/guests', requireAdminApi, guestAction(async (req) => {
   const requestedBy = String(req.body.requestedBy || '').trim().toLowerCase();
   if (requestedBy && !(await db.getUserByEmail(requestedBy))) {
@@ -1009,13 +882,12 @@ app.post('/api/events/:id/guests', requireAdminApi, guestAction(async (req) => {
   });
 }));
 
-app.post('/api/events/:id/guests/:guestId/approve', requireAdminApi, guestAction(req =>
-  db.approveEventGuest(req.params.id, guestIdOf(req), req.session.user.email)));
-
-// 移出 — back to the pending list, not deleted: the request is still the member's
-// and becomes cancellable by them again. It frees one of the three places.
-app.post('/api/events/:id/guests/:guestId/unapprove', requireAdminApi, guestAction(req =>
-  db.unapproveEventGuest(req.params.id, guestIdOf(req))));
+// 移出 — the row is **deleted**. A guest is on the event because an admin put
+// them there, so taking them off is removing the record of it, not sending it
+// back to anywhere; db.js frees the 总人数 place with it and promotes the head of
+// the queue.
+app.post('/api/events/:id/guests/:guestId/remove', requireAdminApi, guestAction(req =>
+  db.removeEventGuest(req.params.id, guestIdOf(req))));
 
 // Wipe an event's roster. Destructive and admin-only — the waitlist and the
 // check-ins go with the signups, since a check-in from someone no longer on the
@@ -1082,7 +954,7 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
   if (where.status) return res.status(where.status).json(where.body);
   // The coordinates go in with the time, as the evidence behind the row, and the
   // 自动分队 draw happens in there too — `team` is null only when the event has no
-  // team size at all (nobody signed up and no approved guest), the "no teams
+  // team size at all (nobody signed up and no guest), the "no teams
   // here" answer.
   const done = await db.checkInToEvent(event.id, email, where);
   // The event was deleted between the read above and the write; nothing was
@@ -1106,7 +978,7 @@ app.post('/event/:id/checkin', requireLogin, wrap(async (req, res) => {
 // Fines are untouched by this — `lateness` reads `checked_in_at` alone, so a
 // member checked in late by an admin owes exactly what they would have owed.
 app.post('/event/:id/checkin-for', requireAdminApi, wrap(async (req, res) => {
-  // No `canSeeEvent` here, like every other admin-only route: an admin sees
+  // No `canSee` here, like every other admin-only route: an admin sees
   // every event, so the rule could only ever pass.
   const event = await db.getEvent(req.params.id);
   if (!event) return res.status(404).json({ ok: false, message: '活动不存在' });
@@ -1425,10 +1297,9 @@ function validateEvent(event) {
   if (!Number.isInteger(event.checkinRadius) || event.checkinRadius <= 0) {
     return 'checkinRadius 必须为正整数';
   }
-  // Both coerced in place to the shapes their columns allow, so what the routes
-  // then hand to `db.createEvent`/`updateEvent` is already normalized.
+  // Coerced in place to the shape its column allows, so what the routes then
+  // hand to `db.createEvent`/`updateEvent` is already normalized.
   try {
-    event.visibility = db.normalizeVisibility(event.visibility);
     event.teamCount = db.normalizeTeamCount(event.teamCount);
   } catch (err) {
     return err.message;
@@ -1436,22 +1307,12 @@ function validateEvent(event) {
   return null;
 }
 
-// The half of the visibility check that needs the database: a visibility naming
-// a member only means something if that member exists — a typo would otherwise
-// create an event literally nobody but an admin can see. Returns the complaint,
-// or null when the value is fine.
-async function checkVisibilityTarget(visibility) {
-  if (visibility === db.VISIBLE_ALL || visibility === db.VISIBLE_ADMIN) return null;
-  return (await db.getUserByEmail(visibility)) ? null : `找不到成员 ${visibility}`;
-}
-
-// 试训/Guest: `event.guestRequests` carries the pending queue as well as the
-// approved rows, and **both are public** — the event page shows both to every
+// 试训/Guest: `event.guestList` is **public** — the event page shows it to every
 // member — so nothing is filtered out of the API either. This used to be an
 // admin-only list with a `forViewer` filter here to keep the JSON in step with
-// the page; it went when the page opened the queue up. If either list is ever
-// restricted again, both this file's API routes and `/event/:id` have to apply
-// the same rule, or the names one hides are a fetch away from the other.
+// the page; it went when the page opened the list up. If it is ever restricted
+// again, both this file's API routes and `/event/:id` have to apply the same
+// rule, or the names one hides are a fetch away from the other.
 
 // JSON API — no delete; creating is admin-only, editing is not (POC)
 app.get('/api/events', requireLoginApi, wrap(async (req, res) => {
@@ -1482,11 +1343,11 @@ app.put('/api/events/:id', requireLoginApi, wrap(async (req, res) => {
 
   // `date`/`endDate`/`time` are derived from these two by `rowToEvent` and are
   // read-only — writing them would be silently dropped, so they are not listed.
-  const EDITABLE_FIELDS = ['title', 'startAt', 'endAt', 'location', 'coords', 'description', 'capacity', 'checkinRadius', 'visibility', 'teamCount'];
+  const EDITABLE_FIELDS = ['title', 'startAt', 'endAt', 'location', 'coords', 'description', 'capacity', 'checkinRadius', 'teamCount'];
   for (const field of EDITABLE_FIELDS) {
     if (req.body[field] !== undefined) event[field] = req.body[field];
   }
-  const error = validateEvent(event) || await checkVisibilityTarget(event.visibility);
+  const error = validateEvent(event);
   if (error) return res.status(400).json({ ok: false, message: error });
 
   await db.updateEvent(event);
@@ -1509,13 +1370,11 @@ app.post('/api/events', requireAdminApi, wrap(async (req, res) => {
     // from the event page's test-settings card.
     coords: req.body.coords === undefined ? null : req.body.coords,
     checkinRadius: req.body.checkinRadius === undefined ? 10 : req.body.checkinRadius,
-    // Open to every member unless the form says otherwise.
-    visibility: req.body.visibility === undefined ? db.VISIBLE_ALL : req.body.visibility,
     // 队伍数量 — 3 unless the form says otherwise, the same value every event
     // written before the field existed reads as.
     teamCount: req.body.teamCount === undefined ? db.DEFAULT_TEAM_COUNT : req.body.teamCount
   };
-  const error = validateEvent(event) || await checkVisibilityTarget(event.visibility);
+  const error = validateEvent(event);
   if (error) return res.status(400).json({ ok: false, message: error });
 
   res.status(201).json(await db.createEvent(event));

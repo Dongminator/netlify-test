@@ -401,7 +401,7 @@
   overflow-wrap: anywhere;
 }
 
-/* 已批准 and 待批准, stacked in the one block. The second is separated by a dashed
+/* 名单 and 候补, stacked in the one block. The second is separated by a dashed
    rule rather than sitting in a box of its own: they are two halves of one list,
    and the sidebar has no room for a second bordered card. Only the *second* one
    takes the rule, so whichever is rendered first runs straight on from the head
@@ -413,9 +413,9 @@
   border-top: 1px dashed var(--gsf-line);
 }
 
-/* The heading is the only thing that says 已批准 / 待批准 — the rows under it do
-   not repeat themselves. 已批准 is green because it is the half that means a real
-   place at the event; 待批准 stays muted, like the queue it names. */
+/* The heading is the only thing that says 名单 / 候补 — the rows under it do not
+   repeat themselves. 名单 is green because it is the half that means a real place
+   at the event; 候补 stays muted, like the queue it names. */
 .guest-sub-head {
   margin-bottom: .375rem;
   font-size: .8125rem;
@@ -431,7 +431,7 @@
   color: var(--gsf-ink-faint);
 }
 
-/* An approved 试训/Guest waiting for a place rather than holding one. It is the
+/* A 试训/Guest waiting for a place rather than holding one. It is the
    same fact the roster grid's `.roster-queue` badge carries for a member, and it
    is deliberately the same blue: the queue is one queue, so 候补 3 in this list
    and 3 on the avatar grid are the same position in the same line. A chip rather
@@ -447,46 +447,8 @@
   line-height: 1.5;
 }
 
-/* The cancel form must not add layout — it is only there to carry the POST. */
-.guest-cancel {
-  margin: 0;
-}
-
-/* A link-weight control, but padded to stay a real touch target on a phone: it
-   sits at the end of a dense list line where a full `.btn` would break the row. */
-.guest-cancel-btn {
-  padding: .125rem .375rem;
-  border: 0;
-  border-radius: .25rem;
-  background: none;
-  color: #dc3545;
-  font-size: .8125rem;
-  line-height: 1.5;
-}
-
-.guest-cancel-btn:hover,
-.guest-cancel-btn:focus {
-  background: rgba(220, 53, 69, .08);
-  text-decoration: underline;
-}
-
-@media (hover: none) {
-  .guest-cancel-btn {
-    min-height: 2rem;
-    padding-right: .625rem;
-    padding-left: .625rem;
-  }
-}
-
-/* 审核/添加 试训/Guest dialog. Three stacked sections — approved, pending, add — each
-   headed and ruled off, so the two lists never read as one. */
-.guest-note {
-  margin-bottom: 1rem;
-  font-size: .8125rem;
-  line-height: 1.5;
-  color: var(--gsf-ink-soft);
-}
-
+/* 添加/移出 试训/Guest dialog. Two stacked sections — the list and 直接添加 — each
+   headed and ruled off, so they never read as one. */
 .guest-section + .guest-section {
   margin-top: 1.25rem;
   padding-top: 1rem;

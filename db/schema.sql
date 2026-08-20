@@ -55,16 +55,13 @@ CREATE TABLE IF NOT EXISTS gsffc.user_photos (
 --
 -- `date`, `endDate` and `time` still exist as read-only derived fields on the
 -- app's event object (db.js `rowToEvent`), which is why the calendar kept working.
--- `visibility` is who may see the event at all — not a rendering flag: an event
--- the viewer cannot see is absent from the calendar and from /api/events, and
--- its page 404s. Exactly three shapes, and the CHECK is what keeps it to them:
---   'ALL'    — every signed-in member (the default, i.e. every existing row)
---   'ADMIN'  — administrators only
---   an email — that one member, and nobody else
--- Administrators always see everything regardless, which is what stops an event
--- from being created that nobody left can manage. The address is stored
--- lowercase and carries no foreign key to `users`, for the same reason
--- `event_signups.email` doesn't: the seeds may name members without accounts.
+-- `visibility` is **no longer used by the app**: per-event visibility is gone,
+-- and who may see an event is now 报名开放时间 alone (server.js `canSee` — an
+-- event belongs to the administrators until 20:00 on the Wednesday before it,
+-- and to every member after). Nothing reads or writes the column any more; it is
+-- left in place, with its default and its CHECK, because this file is re-applied
+-- to live databases and does not do destructive DDL. Drop it by hand in psql if
+-- it is ever really wanted gone.
 CREATE TABLE IF NOT EXISTS gsffc.events (
   id          TEXT PRIMARY KEY,
   title       TEXT NOT NULL,
@@ -81,6 +78,7 @@ CREATE TABLE IF NOT EXISTS gsffc.events (
   -- gone — member or 试训 alike — is recorded on the waitlist.
   capacity    INTEGER NOT NULL DEFAULT 0,
   checkin_radius INTEGER NOT NULL DEFAULT 10,
+  -- Unused; see the note above the table.
   visibility  TEXT NOT NULL DEFAULT 'ALL',
   -- 自动分队: how many teams this event is split into — 2, 3 or 4, picked by the
   -- admin on the event form. It used to be a hardcoded 3 in db.js, which meant a
@@ -131,9 +129,9 @@ CREATE TABLE IF NOT EXISTS gsffc.event_signups (
 -- checked in, 1..`events.team_count`. The allocation is *random*, which is
 -- exactly why it is the one part of the feature that has to be stored — the team
 -- size (已报名人数 + 试训人数 split team_count ways, i.e. the confirmed rows in
--- `event_signups` plus the confirmed approved ones in `event_guests`) is derived
+-- `event_signups` plus the confirmed ones in `event_guests`) is derived
 -- on every read and never written, so the teams re-size as members sign up or withdraw and
--- as guests are approved, and no column can drift out of agreement with the
+-- as guests are added, and no column can drift out of agreement with the
 -- numbers it was computed from. Same arrangement as 迟到罚款. (The count itself is
 -- stored, on the event, because it is the admin's decision — see there.)
 --
@@ -142,7 +140,7 @@ CREATE TABLE IF NOT EXISTS gsffc.event_signups (
 -- and deleting the event all drop the check-in row and take the allocation with
 -- it, so there is no new cascade anywhere. NULL means "not allocated" — a
 -- check-in recorded before this feature existed, or one on an event that had
--- nobody signed up and no approved guest at all.
+-- nobody signed up and no guest at all.
 CREATE TABLE IF NOT EXISTS gsffc.event_checkins (
   event_id      TEXT NOT NULL REFERENCES gsffc.events(id) ON DELETE CASCADE,
   email         TEXT NOT NULL,
@@ -163,39 +161,38 @@ CREATE INDEX IF NOT EXISTS event_signups_queue_idx
 
 -- 试训/Guest. A trialist or a guest has no account, so they can never sign up,
 -- never check in and never appear on the roster — this table is the only record
--- of them, and it is what 自动分队 sizes the guest places from — the **approved**
--- rows are the places, and the placement rule they are fed into is db.js
--- `eventGuests`.
+-- of them, and it is what 自动分队 sizes the guest places from — every row is a
+-- place, and the placement rule they are fed into is db.js `eventGuests`.
 --
--- A row has two lives, and `approved_at` is which one it is in:
---   NULL     — a pending request. Any member may submit as many as they like,
---              and may cancel their own while it is still pending.
---   NOT NULL — an approved place. **At most db.js MAX_EVENT_GUESTS (3) per
---              event**, which is counted under the event's row lock rather than
---              being expressible as a constraint here. Only an admin approves,
---              and only an admin can send one back to pending ("移出"); the
---              member who asked for it can no longer cancel it.
--- The CHECK is what keeps the pair honest: an approval is a who *and* a when.
+-- **Only an admin writes this table.** A row exists because an admin 添加'd it
+-- and it is deleted outright when they 移出 it; there is no pending state and no
+-- member-facing 申请 any more. **At most db.js MAX_EVENT_GUESTS (3) per event**,
+-- counted under the event's row lock rather than being expressible as a
+-- constraint here.
+--
+-- `approved_by`/`approved_at` are that admin and that moment — 添加人/添加时间,
+-- kept under their old names because this file never rewrites a column
+-- destructively. The CHECK keeps the pair honest: it is a who *and* a when. Rows
+-- left pending by the old 申请/批准 flow have both NULL and count as ordinary
+-- guests.
 --
 -- `type` is stored as the uppercase keyword, like `users.role` and
 -- `event_signups.status`; 试训 / Guest are the labels server.js renders it as.
 --
--- Neither email carries a foreign key to `users`, for the same reason
--- `event_signups.email` doesn't — and here there is a second one: an approved
--- guest is a body the club is expecting, so deleting the member who invited them
--- must not un-invite them mid-event. db.js `deleteUser` therefore drops that
--- member's **pending** rows only (nobody could cancel them otherwise) and leaves
--- the approved ones with the address on them, exactly as `checked_in_by` keeps a
--- deleted admin's.
+-- `requested_by` is the 申请人 the admin named — the member the guest is coming
+-- through — and neither email carries a foreign key to `users`, for the same
+-- reason `event_signups.email` doesn't, plus a second one: a guest is a body the
+-- club is expecting, so deleting the member who invited them must not un-invite
+-- them mid-event. db.js `deleteUser` therefore leaves these rows entirely alone,
+-- with the dead address on them, exactly as `checked_in_by` keeps a deleted
+-- admin's.
 --
 -- `status` is the same pair of keywords as `event_signups.status` and means the
 -- same thing, because `events.capacity` is 总人数 — one number for every body
--- coming, a 试训 exactly like a member. An approved row therefore either holds
--- one of those places (SIGNED_UP) or queues for one (WAITLIST), and the two
+-- coming, a 试训 exactly like a member. A row therefore either holds one of those
+-- places (SIGNED_UP) or queues for one (WAITLIST), and the two
 -- tables share **one** waitlist, served strictly by when each row joined it:
--- `signed_up_at` for a signup, `approved_at` for a guest. It is meaningful only
--- once the row is approved — a pending request holds nothing — and db.js resets
--- it along with the approval when an admin 移出s one. `promoted_at` is when the
+-- `signed_up_at` for a signup, `approved_at` (添加时间) for a guest. `promoted_at` is when the
 -- queue reached them, NULL for a guest confirmed from the start, the mirror of
 -- `event_signups.promoted_at`. Rows written before the column existed read as
 -- SIGNED_UP, which is what they were.
@@ -218,13 +215,12 @@ CREATE TABLE IF NOT EXISTS gsffc.event_guests (
   CONSTRAINT event_guests_status_shape CHECK (status IN ('SIGNED_UP', 'WAITLIST'))
 );
 
--- Both hot reads are one event's rows split into approved and pending, each half
--- in the order it was decided in — which is also the order the guest places are
--- handed out down the teams.
+-- The hot read is one event's rows in the order they were added, which is also
+-- the order the guest places are handed out down the teams.
 CREATE INDEX IF NOT EXISTS event_guests_event_idx
   ON gsffc.event_guests (event_id, approved_at, requested_at);
 
 -- Counting the confirmed guests against 总人数, and picking the next queueing one
--- off the shared waitlist, are the two reads every roster write now makes.
+-- off the shared waitlist, are the two reads every roster write makes.
 CREATE INDEX IF NOT EXISTS event_guests_queue_idx
   ON gsffc.event_guests (event_id, status, approved_at);
