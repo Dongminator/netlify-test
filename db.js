@@ -956,15 +956,20 @@ async function addEventGuest(eventId, { type, name, by, requestedBy }) {
 }
 
 // 自动分队 — the team an arriving member joins, which is the club's rule exactly,
-// in every one of the three layouts: **the teams are filled in pairs**, a random
-// one of the pair while both have room and the one that still has room once the
-// other is full, moving on to the next pair when neither does — and whatever is
-// left over goes into the **last** team, which is therefore the overflow and is
-// deliberately **uncapped**.
+// in every one of the three layouts: **only 黑桃/红桃 are drawn between**, a random
+// one of the two while both have room and the one that still has room once the
+// other is full — and **everything after them is filled in order**, team by team,
+// with whatever is left over going into the **last** team, which is therefore the
+// overflow and is deliberately **uncapped**.
 //
-//   2 teams → the pair is 黑桃/红桃, and 红桃 is also the overflow
+//   2 teams → the draw is 黑桃/红桃, and 红桃 is also the overflow
 //   3 teams → 黑桃/红桃 first, then everybody else onto the 板凳
-//   4 teams → 黑桃/红桃 first, then a random draw between 梅花/方片, 方片 last
+//   4 teams → 黑桃/红桃 first, then 梅花 until it is full, then 方片
+//
+// The draw used to run in **pairs** — 黑桃/红桃, then a second random one between
+// 梅花/方片 — which made the two late teams interchangeable. They are not: filling
+// them in order is what makes arriving earlier worth something, since 梅花 closes
+// before 方片 opens and the last arrivals are the ones who land in the overflow.
 //
 // Uncapped, because the sizes count approved 试训/Guest who never check in, and
 // members can withdraw after arriving to shrink them, so the app's check-ins can
@@ -1026,14 +1031,13 @@ async function pickTeam(client, eventId, event = {}) {
   for (const g of guests) taken.set(g.team, (taken.get(g.team) || 0) + 1);
   // Against this team's own number, not one shared size — see `teamSizes`.
   const hasRoom = team => (taken.get(team) || 0) < sizes[team - 1];
-  // Pairs, in order. An odd `teamCount` leaves its last team out of the loop —
-  // which is right, since that one is the overflow and is answered below anyway.
-  for (let a = 1; a + 1 <= teamCount; a += 2) {
-    const b = a + 1;
-    if (hasRoom(a) && hasRoom(b)) return a + crypto.randomInt(2);
-    if (hasRoom(a)) return a;
-    if (hasRoom(b)) return b;
-  }
+  // The one draw there is: 黑桃/红桃 while both still have room.
+  if (teamCount >= 2 && hasRoom(1) && hasRoom(2)) return 1 + crypto.randomInt(2);
+  // Everything else in order — including whichever of 黑桃/红桃 the draw above
+  // fell through on, since only one of them can still have room by then. The
+  // last team is left out of the loop: it is the overflow and is answered below
+  // whether it has room or not.
+  for (let team = 1; team < teamCount; team++) if (hasRoom(team)) return team;
   return teamCount;
 }
 

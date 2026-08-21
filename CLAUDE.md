@@ -281,13 +281,18 @@ see 迟到罚款/check-in below. `db/schema.sql` deliberately carries **no CHECK
 `pickTeam` in [db.js](db.js) is what keeps it inside the event's own count.
 
 `pickTeam` is the club's rule exactly, in all three layouts: **each team is filled to its own number**
-(`teamSizes[team - 1]`, never one figure shared by all of them) and **the teams are filled in pairs** — a
-random one of the pair (`crypto.randomInt`) while both have room, the one that still has room once the
-other is full, moving on to the next pair when neither does — and **whatever is left over goes into the
-last team, which is the overflow and is deliberately uncapped**. So 黑桃/红桃 fill first everywhere; a
-2-team event then keeps pouring into 红桃, a 3-team one onto the 板凳, and a 4-team one draws randomly
-between 梅花/方片 before settling on 方片. An odd `teamCount` leaves its last team out of the pairing
-loop, which is right — that one is the overflow and is answered after it.
+(`teamSizes[team - 1]`, never one figure shared by all of them), **黑桃/红桃 are the only teams drawn
+between** — a random one of the two (`crypto.randomInt`) while both have room, the one that still has
+room once the other is full — **every team after them is filled in order**, and **whatever is left over
+goes into the last team, which is the overflow and is deliberately uncapped**. So 黑桃/红桃 fill first
+everywhere; a 2-team event then keeps pouring into 红桃, a 3-team one onto the 板凳, and a 4-team one
+fills 梅花 to its number before anybody reaches 方片.
+
+**The draw used to run in pairs** — 黑桃/红桃, then a second random one between 梅花/方片 — which made
+the two late teams interchangeable. They are not, and filling them in order is what makes arriving
+earlier worth something: 梅花 closes before 方片 opens, so the last arrivals are the ones who land in the
+overflow. The order is the arrival order and nothing else — it is not a punishment the app records
+anywhere, and 迟到罚款 stays the only thing that prices lateness.
 
 It is not round-robin, and that has a visible consequence: the sizes count everybody signed up and every
 guest, and plenty of them never check in — so 21 expected in three teams with 15 arrivals gives
